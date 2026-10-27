@@ -1,17 +1,28 @@
 # PTT Notify — Cloudflare Workers 版
 
-跟 GAS 版功能相同（關鍵字 / 作者 / 推文數），差別：
+追蹤 PTT 看板，符合條件時用 Telegram 通知你：
 
-- **用 Telegram 指令管理規則**，不需要試算表
-- 資料存在 **D1**（Cloudflare 的 SQLite）
-- 每分鐘檢查一次（免費方案即可）
+- **關鍵字**：標題包含指定文字
+- **作者**：指定 ID 發文
+- **推文數**：推文數 ≥ 指定數字（`爆` = 100）
 
-## 操作
+特色：
 
-傳 `/start` 後，輸入框下方會出現常駐按鈕：📋 規則列表、➕ 新增規則、🔄 立即檢查、❓ 說明。
+- 用 Telegram 按鈕 / 指令管理規則，不需要任何網頁或試算表
+- 每分鐘檢查一次，跑在 Cloudflare 免費方案上
+- **可以多人共用**：朋友傳訊息給你的 bot 會送出申請，你核准後他就能設定自己的規則
 
-- **規則列表**：每條規則旁有「⏸ 暫停 / ▶️ 恢復」與「🗑 刪除」按鈕（刪除會再確認一次）
-- **新增規則**：bot 會請你回覆「看板 類型 條件值」，例如 `Stock 關鍵字 台積電`
+## 使用方式
+
+傳 `/start` 給 bot，輸入框下方會出現常駐按鈕：
+
+| 按鈕 | 說明 |
+|---|---|
+| 📋 規則列表 | 列出你的規則，每條旁有「⏸ 暫停 / ▶️ 恢復」「🗑 刪除」按鈕 |
+| ➕ 新增規則 | bot 會請你回覆「看板 類型 條件值」，例如 `Stock 關鍵字 台積電` |
+| 🔄 立即檢查 | 馬上檢查一次，完成後回覆摘要 |
+| ❓ 說明 | 顯示說明 |
+| 👥 使用者 | （僅管理員）核准 / 停用其他使用者 |
 
 也可以直接輸入指令：
 
@@ -21,48 +32,122 @@
 | `/add 看板 類型 條件值` | 新增規則，類型：`關鍵字` / `作者` / `推文數`（也可用 `keyword` / `author` / `push`） |
 | `/del 序號` | 刪除規則（序號為 `/list` 的排列順序） |
 | `/off 序號`、`/on 序號` | 暫停 / 恢復規則 |
-| `/check` | 立即檢查一次，完成後回覆摘要（新文章數、抓取失敗等） |
+| `/check` | 立即檢查一次 |
+| `/users` | （僅管理員）管理使用者 |
 
 例：`/add Stock 關鍵字 台積電`、`/add Stock 推文數 50`、`/add Gossiping 作者 someone`
 
-新規則（以及 `/on` 恢復的規則）第一次檢查只記錄現有文章、不通知，避免洗版。
-只有 `TG_CHAT_ID` 這個 chat 傳的指令會被處理。
+- 新規則（以及恢復的規則）第一次檢查只記錄現有文章、不通知，避免洗版。
+- 只比對**標題**，不含內文。
 
-## 部署
+### 多人共用
 
-需要 Cloudflare 帳號（免費）。以下指令都在 `worker/` 資料夾執行。
+- 其他人傳任何訊息給 bot，會自動送出申請，你（管理員）會收到通知，按「✅ 核准」或「⛔ 拒絕」。
+- 每個人只看得到、也只能管理自己的規則，通知也只送給自己。
+- 一般使用者最多 10 條規則（`src/index.js` 的 `MAX_RULES_PER_USER`），管理員不限。
+- 也可以把 bot 加進 Telegram 群組，整個群組共用一組規則（同樣需要核准）。
+  群組裡請用 `/list@你的bot` 這類指令；常駐按鈕在群組中需要到 @BotFather 關閉 bot 的 Group Privacy 才會生效。
+- 你身為管理員可以在資料庫看到所有人的規則，開放給別人前請讓對方知道。
 
-1. 安裝並登入（會開瀏覽器）：
-   ```sh
-   npm install
-   npx wrangler login
-   ```
-2. 建立 D1 資料庫，把輸出的 `database_id` 填進 `wrangler.jsonc`：
-   ```sh
-   npx wrangler d1 create ptt-notify
-   ```
-3. 建立資料表：
-   ```sh
-   npm run db:migrate
-   ```
-4. 設定 secrets（每個會提示你輸入值）：
-   ```sh
-   npx wrangler secret put TG_TOKEN
-   npx wrangler secret put TG_CHAT_ID
-   npx wrangler secret put TG_WEBHOOK_SECRET   # 自訂一串隨機字（英數、_、-）
-   ```
-5. 部署，記下輸出的網址（`https://ptt-notify.<你的子網域>.workers.dev`）：
-   ```sh
-   npm run deploy
-   ```
-6. 設定 Telegram webhook，在瀏覽器打開（替換三個值）：
-   ```
-   https://api.telegram.org/bot<TG_TOKEN>/setWebhook?url=https://ptt-notify.<子網域>.workers.dev/telegram&secret_token=<TG_WEBHOOK_SECRET>
-   ```
-   看到 `"ok":true` 即完成。到 Telegram 對 bot 傳 `/help` 測試。
+## 自己架一套
 
-> 同一個 bot 設了 webhook 後，GAS 版的 `getChatId()`（getUpdates）就不能用了。
-> 兩個版本同時跑會重複通知，請只啟用一個。
+全部免費，大約 15 分鐘。需要：
+
+- [Node.js](https://nodejs.org/) 18 以上、[Git](https://git-scm.com/)
+- [Cloudflare 帳號](https://dash.cloudflare.com/sign-up)（免費，**註冊後記得驗證 email**，否則無法部署 Workers）
+- Telegram 帳號
+
+### 1. 建立 Telegram bot
+
+1. 在 Telegram 搜尋 [@BotFather](https://t.me/BotFather)，傳 `/newbot`，依指示取名。
+2. 記下它給你的 **token**（像 `123456789:AAH...`）。
+3. 對你的新 bot 傳一則訊息（隨便打）。
+4. 用瀏覽器打開 `https://api.telegram.org/bot<token>/getUpdates`（`<token>` 整段換成你的 token，不要留角括號），
+   找到 `"chat":{"id":123456789` 這段，這個數字就是你的 **chat id**。
+
+### 2. 下載程式並登入 Cloudflare
+
+```sh
+git clone https://github.com/george16886/PTT-Notify.git
+cd PTT-Notify/worker
+npm install
+npx wrangler login          # 會開瀏覽器，按 Allow
+```
+
+### 3. 建立資料庫
+
+```sh
+npx wrangler d1 create ptt-notify
+```
+
+把輸出中的 `database_id` 貼到 `wrangler.jsonc`，取代原本的值。接著建立資料表：
+
+```sh
+npm run db:migrate
+```
+
+### 4. 設定 secrets
+
+```sh
+npx wrangler secret put TG_TOKEN            # 貼上 bot token
+npx wrangler secret put TG_CHAT_ID          # 貼上你的 chat id（你就是管理員）
+npx wrangler secret put TG_WEBHOOK_SECRET   # 自訂一串英數字，只能用 A-Z a-z 0-9 _ -
+```
+
+需要隨機字串可以用：
+
+```sh
+node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
+```
+
+### 5. 部署
+
+```sh
+npm run deploy
+```
+
+記下輸出的網址，例如 `https://ptt-notify.<你的子網域>.workers.dev`。
+第一次部署若提示要註冊 workers.dev 子網域，到 Cloudflare 後台 Workers & Pages 設定一個即可。
+
+### 6. 連接 Telegram
+
+用瀏覽器打開（換成你的網址和 `TG_WEBHOOK_SECRET`）：
+
+```
+https://ptt-notify.<你的子網域>.workers.dev/setup?key=<TG_WEBHOOK_SECRET>
+```
+
+看到三個 `"ok":true` 就完成了。到 Telegram 對 bot 傳 `/start` 開始使用。
+
+> 設定 webhook 後，第 1 步的 `getUpdates` 網址就不能用了，這是正常的。
+
+## 更新
+
+```sh
+git pull
+npm install
+npm run db:migrate   # 有新的資料表變更時
+npm run deploy
+```
+
+更新後若指令選單沒有變化，再打開一次 `/setup` 網址。
+
+## 疑難排解
+
+| 狀況 | 解法 |
+|---|---|
+| 部署時出現 `verify your email address` | 到信箱點 Cloudflare 的驗證信 |
+| `/setup` 顯示 `forbidden` | 網址的 `key` 和 `TG_WEBHOOK_SECRET` 不一致 |
+| `/setup` 顯示 secret 只能包含英數字 | 重新 `wrangler secret put TG_WEBHOOK_SECRET`，只用英數字、`_`、`-` |
+| 傳訊息給 bot 沒反應 | 打開 `https://api.telegram.org/bot<token>/getWebhookInfo` 看 `url` 和 `last_error_message` |
+| 管理員收不到申請通知 | `TG_CHAT_ID` 填錯；重新 `wrangler secret put TG_CHAT_ID` |
+| 想看執行紀錄 | `npx wrangler tail`，或 Cloudflare 後台 → ptt-notify → Logs |
+
+## 設定
+
+- **檢查頻率**：`wrangler.jsonc` 的 `triggers.crons`，預設 `* * * * *`（每分鐘）。規則很多時建議放寬到 `*/5 * * * *`。
+- **免費方案限制**：每次執行最多 50 個對外請求（抓 PTT + 傳 Telegram）。相同的搜尋條件會合併成一次請求，
+  不重複的條件超過約 40 個時，請升級 Workers Paid 方案或減少規則。
 
 ## 開發
 
@@ -73,5 +158,3 @@ npm run dev
 ```
 
 手動觸發定時檢查：`curl "http://127.0.0.1:8787/cdn-cgi/handler/scheduled"`
-
-檢查頻率改 `wrangler.jsonc` 的 `triggers.crons`（UTC），再重新部署。

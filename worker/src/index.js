@@ -2,16 +2,20 @@
  * PTT Notify — Cloudflare Workers + D1 + Telegram
  *
  * 追蹤 PTT 看板：標題關鍵字 / 特定作者 / 推文數門檻，符合時推播到 Telegram。
- * 規則用 Telegram 指令管理（/add、/list、/del…），資料存在 D1。
+ * 規則用 Telegram 指令與按鈕管理，資料存在 D1。
+ * 可多人共用：其他人傳訊息給 bot 會送出申請，管理員核准後即可使用（每人各自的規則）。
  *
  * Secrets（wrangler secret put）：
  *   TG_TOKEN           Telegram Bot token
- *   TG_CHAT_ID         接收通知、允許下指令的 chat id
- *   TG_WEBHOOK_SECRET  Telegram webhook 的 secret_token
+ *   TG_CHAT_ID         管理員的 chat id
+ *   TG_WEBHOOK_SECRET  Telegram webhook 的 secret_token（只能用英數字、_、-）
+ *
+ * 部署後打開 https://<worker 網址>/setup?key=<TG_WEBHOOK_SECRET> 設定 webhook 與指令選單。
  */
 
 const PTT_BASE = 'https://www.ptt.cc';
 const SEEN_KEEP_PER_RULE = 100;   // 每條規則保留的已通知紀錄數
+const MAX_RULES_PER_USER = 10;    // 一般使用者的規則上限（管理員不限）
 
 // 類型 → PTT 搜尋語法
 const RULE_TYPES = {
@@ -37,6 +41,7 @@ const HELP = `<b>PTT Notify</b>
 /check — 立即檢查一次
 
 新規則第一次檢查只記錄現有文章、不通知。`;
+const ADMIN_HELP = `\n\n<b>管理員</b>\n/users — 管理使用者（核准 / 停用）`;
 
 // 常駐選單按鈕 → 對應指令
 const MENU = {
@@ -44,15 +49,17 @@ const MENU = {
   '➕ 新增規則': '/add',
   '🔄 立即檢查': '/check',
   '❓ 說明': '/help',
+  '👥 使用者': '/users',
 };
-const MAIN_KEYBOARD = {
+const keyboard = admin => ({
   keyboard: [
     [{ text: '📋 規則列表' }, { text: '➕ 新增規則' }],
     [{ text: '🔄 立即檢查' }, { text: '❓ 說明' }],
+    ...(admin ? [[{ text: '👥 使用者' }]] : []),
   ],
   resize_keyboard: true,
   is_persistent: true,
-};
+});
 // Telegram 左下角「Menu」的指令清單
 const COMMANDS = [
   { command: 'list', description: '列出規則' },
@@ -60,6 +67,7 @@ const COMMANDS = [
   { command: 'check', description: '立即檢查一次' },
   { command: 'help', description: '說明' },
 ];
+const ADMIN_COMMANDS = [...COMMANDS, { command: 'users', description: '管理使用者' }];
 // 按「新增規則」後的提示；使用者回覆這則訊息時視為 /add
 const ADD_PROMPT = '請回覆：看板 類型 條件值';
 const ACTION_LABEL = { del: '已刪除', on: '已恢復', off: '已暫停' };
@@ -82,62 +90,157 @@ export default {
       }
       return new Response('ok'); // 一律回 200，避免 Telegram 重送
     }
+    if (url.pathname === '/setup') return setup(env, url);
     return new Response('PTT Notify');
   },
 };
 
+/** 設定 webhook 與指令選單：GET /setup?key=<TG_WEBHOOK_SECRET> */
+async function setup(env, url) {
+  const secret = env.TG_WEBHOOK_SECRET || '';
+  if (!secret || url.searchParams.get('key') !== secret) return new Response('forbidden', { status: 403 });
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(secret)) {
+    return new Response('TG_WEBHOOK_SECRET 只能包含英數字、_、-，請重新設定', { status: 400 });
+  }
+  await adoptOrphanRules(env);
+  const result = {
+    setWebhook: await tg(env, 'setWebhook', {
+      url: `${url.origin}/telegram`, secret_token: secret, allowed_updates: ['message', 'callback_query'],
+    }),
+    setMyCommands: await tg(env, 'setMyCommands', { commands: COMMANDS }),
+    setAdminCommands: await tg(env, 'setMyCommands', {
+      commands: ADMIN_COMMANDS, scope: { type: 'chat', chat_id: env.TG_CHAT_ID },
+    }),
+  };
+  return Response.json(result, { status: Object.values(result).every(r => r.ok) ? 200 : 500 });
+}
+
+/* ---------- 使用者 ---------- */
+
+const isAdmin = (env, chatId) => String(chatId) === String(env.TG_CHAT_ID);
+
+async function hasAccess(env, chatId) {
+  if (isAdmin(env, chatId)) return true;
+  const user = await env.DB.prepare('SELECT status FROM users WHERE chat_id = ?').bind(String(chatId)).first();
+  return user?.status === 'allowed';
+}
+
+/** 舊版（單人）留下沒有擁有者的規則，歸給管理員 */
+function adoptOrphanRules(env) {
+  return env.DB.prepare('UPDATE rules SET chat_id = ? WHERE chat_id IS NULL').bind(String(env.TG_CHAT_ID)).run();
+}
+
+function chatName(chat) {
+  if (chat.title) return `${chat.title}（群組）`;
+  const name = [chat.first_name, chat.last_name].filter(Boolean).join(' ') || String(chat.id);
+  return chat.username ? `${name} (@${chat.username})` : name;
+}
+
+async function requestAccess(env, chat) {
+  const chatId = String(chat.id);
+  const name = chatName(chat);
+  await env.DB.prepare('INSERT OR IGNORE INTO users (chat_id, name) VALUES (?, ?)').bind(chatId, name).run();
+  await sendMessage(env, chatId, '👋 這是私人的 PTT 通知 bot，已替你送出使用申請，管理員核准後會通知你。');
+  await sendMessage(env, env.TG_CHAT_ID, `🙋 新的使用申請：${esc(name)}\nchat id：<code>${chatId}</code>`, {
+    reply_markup: { inline_keyboard: [[
+      { text: '✅ 核准', callback_data: `allow:${chatId}` },
+      { text: '⛔ 拒絕', callback_data: `block:${chatId}` },
+    ]] },
+  });
+}
+
+/** 變更使用者狀態，回傳使用者（找不到則為 null） */
+async function setUserStatus(env, chatId, status) {
+  const user = await env.DB.prepare('UPDATE users SET status = ? WHERE chat_id = ? RETURNING *')
+    .bind(status, chatId).first();
+  if (user && status === 'allowed') {
+    await sendMessage(env, chatId, '✅ 管理員已核准，傳 /start 開始使用');
+  }
+  return user;
+}
+
+async function renderUsers(env) {
+  const { results } = await env.DB.prepare(`
+    SELECT u.*, (SELECT COUNT(*) FROM rules r WHERE r.chat_id = u.chat_id) AS rule_count
+    FROM users u ORDER BY u.created_at`).all();
+  if (!results.length) return { text: '目前沒有其他使用者', markup: { inline_keyboard: [] } };
+  const icon = { pending: '⏳', allowed: '✅', blocked: '⛔' };
+  return {
+    text: results.map((u, i) =>
+      `${i + 1}. ${icon[u.status] || '❔'} ${esc(u.name)}（${u.rule_count} 條規則）`).join('\n'),
+    markup: {
+      inline_keyboard: results.map((u, i) => [u.status === 'allowed'
+        ? { text: `⛔ 停用 ${i + 1}`, callback_data: `block:${u.chat_id}` }
+        : { text: `✅ 核准 ${i + 1}`, callback_data: `allow:${u.chat_id}` }]),
+    },
+  };
+}
+
 /* ---------- 定時檢查 ---------- */
 
-/** 執行一次檢查，回傳統計（給 /check 的摘要用） */
-async function check(env) {
+/** 執行一次檢查；有指定 focusChat 時回傳該 chat 的統計（給 /check 的摘要用） */
+async function check(env, focusChat = null) {
   const stats = { rules: 0, sent: 0, sendFailed: 0, initedRules: 0, initedPosts: 0, fetchFailed: [] };
-  const { results: rules } = await env.DB.prepare('SELECT * FROM rules WHERE enabled = 1').all();
-  stats.rules = rules.length;
+  const mine = rule => rule.chat_id === focusChat;
+
+  await adoptOrphanRules(env);
+  // 管理員與已核准使用者的規則
+  const { results: rules } = await env.DB.prepare(`
+    SELECT r.* FROM rules r LEFT JOIN users u ON u.chat_id = r.chat_id
+    WHERE r.enabled = 1 AND (r.chat_id = ? OR u.status = 'allowed')`).bind(String(env.TG_CHAT_ID)).all();
+  stats.rules = rules.filter(mine).length;
   if (!rules.length) return stats;
 
   const { results: seenRows } = await env.DB.prepare('SELECT rule_id, post_id FROM seen').all();
   const seen = new Set(seenRows.map(r => r.rule_id + '#' + r.post_id));
 
-  const lists = await Promise.all(rules.map(rule =>
-    fetchPosts(rule).catch(e => {
-      console.warn(`抓取失敗 ${rule.board} ${rule.type}=${rule.value}: ${e.message}`);
-      stats.fetchFailed.push(`${ruleLabel(rule)}（${e.message}）`);
-      return null;
-    })));
+  // 相同的搜尋條件（不同使用者）只抓一次
+  const queryKey = rule => `${rule.board.toLowerCase()}|${rule.type}|${rule.value}`;
+  const pending = new Map();
+  rules.forEach(rule => {
+    const key = queryKey(rule);
+    if (!pending.has(key)) pending.set(key, fetchPosts(rule).catch(e => ({ error: e.message })));
+  });
+  const lists = new Map(await Promise.all([...pending].map(async ([key, p]) => [key, await p])));
 
-  const hits = new Map();   // 文章 id → { post, board, reasons, ruleIds }
+  const hits = new Map();   // chat_id#文章 id → { chatId, post, board, reasons, ruleIds }
   const newSeen = [];       // [rule_id, post_id]
   const inited = [];
 
-  rules.forEach((rule, i) => {
-    if (!lists[i]) return;
-    lists[i].forEach(post => {
+  rules.forEach(rule => {
+    const list = lists.get(queryKey(rule));
+    if (list.error) {
+      console.warn(`抓取失敗 ${rule.board} ${rule.type}=${rule.value}: ${list.error}`);
+      if (mine(rule)) stats.fetchFailed.push(`${ruleLabel(rule)}（${list.error}）`);
+      return;
+    }
+    list.forEach(post => {
       if (rule.type === '推文數' && post.score < Number(rule.value)) return;
       if (seen.has(rule.id + '#' + post.id)) return;
       if (!rule.initialized) {
         newSeen.push([rule.id, post.id]);
-        stats.initedPosts++;
+        if (mine(rule)) stats.initedPosts++;
         return;
       }
-      const hit = hits.get(post.id) || { post, board: rule.board, reasons: [], ruleIds: [] };
+      const key = rule.chat_id + '#' + post.id;
+      const hit = hits.get(key) || { chatId: rule.chat_id, post, board: rule.board, reasons: [], ruleIds: [] };
       hit.reasons.push(`${rule.type}: ${rule.value}`);
       hit.ruleIds.push(rule.id);
-      hits.set(post.id, hit);
+      hits.set(key, hit);
     });
-    if (!rule.initialized) inited.push(rule.id);
+    if (!rule.initialized) {
+      inited.push(rule.id);
+      if (mine(rule)) stats.initedRules++;
+    }
   });
 
   // 依發文時間排序，舊的先送
   const sorted = [...hits.values()].sort((a, b) => a.post.id.localeCompare(b.post.id));
   for (const hit of sorted) {
-    if (await sendMessage(env, env.TG_CHAT_ID, formatPost(hit))) {
-      hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
-      stats.sent++;
-    } else {
-      stats.sendFailed++;
-    }
+    const ok = await sendMessage(env, hit.chatId, formatPost(hit));
+    if (ok) hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
+    if (hit.chatId === focusChat) ok ? stats.sent++ : stats.sendFailed++;
   }
-  stats.initedRules = inited.length;
 
   const now = Date.now();
   const stmts = [
@@ -221,6 +324,7 @@ function decodeEntities(s) {
 /* ---------- Telegram ---------- */
 
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const ruleLabel = r => `[${r.board}] ${r.type}: ${r.value}`;
 
 function formatPost({ post, board, reasons }) {
   return [
@@ -230,30 +334,33 @@ function formatPost({ post, board, reasons }) {
   ].join('\n');
 }
 
+/** 呼叫 Telegram Bot API，回傳 API 的回應（失敗時 ok 為 false） */
 async function tg(env, method, payload) {
-  const res = await fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    console.warn(`Telegram ${method} 失敗: ` + await res.text());
-    return false;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!data.ok) console.warn(`Telegram ${method} 失敗: ${data.description}`);
+    return data;
+  } catch (e) {
+    console.warn(`Telegram ${method} 失敗: ${e.message}`);
+    return { ok: false, description: e.message };
   }
-  return true;
 }
 
-function sendMessage(env, chatId, text, extra = {}) {
-  return tg(env, 'sendMessage', {
+async function sendMessage(env, chatId, text, extra = {}) {
+  const data = await tg(env, 'sendMessage', {
     chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra,
   });
+  return data.ok;
 }
 
-const ruleLabel = r => `[${r.board}] ${r.type}: ${r.value}`;
-
-/** 規則列表與每條規則的暫停 / 刪除按鈕；顯示連續序號，按鈕內部用資料庫 id */
-async function renderList(env) {
-  const { results } = await env.DB.prepare('SELECT * FROM rules ORDER BY id').all();
+/** 某個 chat 的規則列表與暫停 / 刪除按鈕；顯示連續序號，按鈕內部用資料庫 id */
+async function renderList(env, chatId) {
+  const { results } = await env.DB.prepare('SELECT * FROM rules WHERE chat_id = ? ORDER BY id').bind(chatId).all();
   if (!results.length) {
     return { text: '目前沒有規則，按「➕ 新增規則」或用 /add 新增', markup: { inline_keyboard: [] } };
   }
@@ -268,9 +375,9 @@ async function renderList(env) {
   };
 }
 
-/** 刪除 / 恢復 / 暫停規則，回傳該規則（找不到則為 null） */
-async function applyRuleAction(env, action, id) {
-  const rule = await env.DB.prepare('SELECT * FROM rules WHERE id = ?').bind(id).first();
+/** 刪除 / 恢復 / 暫停規則（限該 chat 自己的規則），回傳該規則（找不到則為 null） */
+async function applyRuleAction(env, action, id, chatId) {
+  const rule = await env.DB.prepare('SELECT * FROM rules WHERE id = ? AND chat_id = ?').bind(id, chatId).first();
   if (!rule) return null;
   const sqls = {
     del: ['DELETE FROM rules WHERE id = ?', 'DELETE FROM seen WHERE rule_id = ?'],
@@ -284,10 +391,28 @@ async function applyRuleAction(env, action, id) {
 
 async function handleCallback(cb, env) {
   const msg = cb.message;
-  if (!msg || String(msg.chat.id) !== String(env.TG_CHAT_ID)) return;
-  const [action, idStr] = (cb.data || '').split(':');
-  const id = Number(idStr);
+  if (!msg) return;
+  const chatId = String(msg.chat.id);
+  const [action, arg] = (cb.data || '').split(':');
   const target = { chat_id: msg.chat.id, message_id: msg.message_id };
+  const answer = (text = '') => tg(env, 'answerCallbackQuery', { callback_query_id: cb.id, text });
+
+  // 管理員：核准 / 停用使用者（申請通知或使用者列表上的按鈕）
+  if (action === 'allow' || action === 'block') {
+    if (!isAdmin(env, chatId)) return answer();
+    const user = await setUserStatus(env, arg, action === 'allow' ? 'allowed' : 'blocked');
+    const result = user ? `${action === 'allow' ? '✅ 已核准' : '⛔ 已停用'} ${user.name}` : '找不到這位使用者';
+    if ((msg.text || '').startsWith('🙋')) {
+      await tg(env, 'editMessageText', { ...target, text: `${msg.text}\n\n${result}` });
+    } else {
+      const view = await renderUsers(env);
+      await tg(env, 'editMessageText', { ...target, text: view.text, parse_mode: 'HTML', reply_markup: view.markup });
+    }
+    return answer(result);
+  }
+
+  if (!await hasAccess(env, chatId)) return answer();
+  const id = Number(arg);
 
   if (action === 'delask') {
     await tg(env, 'editMessageReplyMarkup', {
@@ -297,22 +422,22 @@ async function handleCallback(cb, env) {
         { text: '取消', callback_data: 'list' },
       ]] },
     });
-    return tg(env, 'answerCallbackQuery', { callback_query_id: cb.id });
+    return answer();
   }
 
   let notice = '';
   if (action === 'toggle' || action === 'del') {
     let act = 'del';
     if (action === 'toggle') {
-      const rule = await env.DB.prepare('SELECT enabled FROM rules WHERE id = ?').bind(id).first();
+      const rule = await env.DB.prepare('SELECT enabled FROM rules WHERE id = ? AND chat_id = ?').bind(id, chatId).first();
       act = rule && rule.enabled ? 'off' : 'on';
     }
-    const rule = await applyRuleAction(env, act, id);
+    const rule = await applyRuleAction(env, act, id, chatId);
     notice = rule ? `${ACTION_LABEL[act]} ${ruleLabel(rule)}` : '找不到這條規則，可能已被刪除';
   }
-  const view = await renderList(env);
+  const view = await renderList(env, chatId);
   await tg(env, 'editMessageText', { ...target, text: view.text, parse_mode: 'HTML', reply_markup: view.markup });
-  return tg(env, 'answerCallbackQuery', { callback_query_id: cb.id, text: notice });
+  return answer(notice);
 }
 
 async function handleUpdate(update, env, ctx) {
@@ -320,7 +445,15 @@ async function handleUpdate(update, env, ctx) {
   const msg = update.message;
   if (!msg || !msg.text) return;
   const chatId = String(msg.chat.id);
-  if (chatId !== String(env.TG_CHAT_ID)) return; // 只接受指定 chat 的指令
+  const admin = isAdmin(env, chatId);
+  const reply = (text, extra) => sendMessage(env, chatId, text, extra);
+
+  if (!admin) {
+    const user = await env.DB.prepare('SELECT status FROM users WHERE chat_id = ?').bind(chatId).first();
+    if (!user) return requestAccess(env, msg.chat);
+    if (user.status === 'pending') return reply('⏳ 申請審核中，請等待管理員核准');
+    if (user.status !== 'allowed') return; // 已停用：不回應
+  }
 
   let text = msg.text.trim();
   if (MENU[text]) {
@@ -330,17 +463,20 @@ async function handleUpdate(update, env, ctx) {
   }
   const [cmdRaw, ...args] = text.split(/\s+/);
   const cmd = cmdRaw.toLowerCase().replace(/@.*$/, '');
-  const reply = (text, extra) => sendMessage(env, chatId, text, extra);
 
   switch (cmd) {
     case '/start':
-      await tg(env, 'setMyCommands', { commands: COMMANDS });
-      // fallthrough
     case '/help':
-      return reply(HELP, { reply_markup: MAIN_KEYBOARD });
+      return reply(HELP + (admin ? ADMIN_HELP : ''), { reply_markup: keyboard(admin) });
 
     case '/list': {
-      const view = await renderList(env);
+      const view = await renderList(env, chatId);
+      return reply(view.text, { reply_markup: view.markup });
+    }
+
+    case '/users': {
+      if (!admin) return reply('不認得的指令，輸入 /help 查看用法');
+      const view = await renderUsers(env);
       return reply(view.text, { reply_markup: view.markup });
     }
 
@@ -359,14 +495,18 @@ async function handleUpdate(update, env, ctx) {
       if (type === '推文數' && !(Number.isInteger(+value) && +value >= 1 && +value <= 100)) {
         return reply('推文數請填 1～100 的整數（爆 = 100）');
       }
+      if (!admin) {
+        const { n } = await env.DB.prepare('SELECT COUNT(*) AS n FROM rules WHERE chat_id = ?').bind(chatId).first();
+        if (n >= MAX_RULES_PER_USER) return reply(`每人最多 ${MAX_RULES_PER_USER} 條規則，請先刪除不需要的規則`);
+      }
       try {
         await fetchPosts({ board, type, value });
       } catch (e) {
         return reply(`無法讀取看板 ${esc(board)}（${esc(e.message)}），請確認看板名稱`);
       }
       try {
-        await env.DB.prepare('INSERT INTO rules (board, type, value) VALUES (?, ?, ?)')
-          .bind(board, type, value).run();
+        await env.DB.prepare('INSERT INTO rules (chat_id, board, type, value) VALUES (?, ?, ?, ?)')
+          .bind(chatId, board, type, value).run();
         return reply(`已新增 ${esc(ruleLabel({ board, type, value }))}`);
       } catch (e) {
         if (String(e.message).includes('UNIQUE')) return reply('這條規則已經存在');
@@ -380,16 +520,17 @@ async function handleUpdate(update, env, ctx) {
       // 序號 → 資料庫 id（序號即 /list 的排列順序）
       const pos = parseInt(args[0], 10);
       if (!(pos >= 1)) return reply(`用法：${cmd} 序號（用 /list 查看）`);
-      const row = await env.DB.prepare('SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?').bind(pos - 1).first();
+      const row = await env.DB.prepare('SELECT id FROM rules WHERE chat_id = ? ORDER BY id LIMIT 1 OFFSET ?')
+        .bind(chatId, pos - 1).first();
       const action = cmd.slice(1);
-      const rule = row && await applyRuleAction(env, action, row.id);
+      const rule = row && await applyRuleAction(env, action, row.id, chatId);
       if (!rule) return reply(`找不到第 ${pos} 條規則`);
       return reply(`${ACTION_LABEL[action]} ${esc(ruleLabel(rule))}`);
     }
 
     case '/check':
       await reply('開始檢查…');
-      ctx.waitUntil(check(env)
+      ctx.waitUntil(check(env, chatId)
         .then(stats => reply(formatSummary(stats)))
         .catch(e => reply('❌ 檢查失敗：' + esc(e.message))));
       return;

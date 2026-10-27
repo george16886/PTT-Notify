@@ -1,4 +1,4 @@
-# PTT Notify（Google Apps Script + Telegram）
+# PTT Notify
 
 追蹤 PTT 看板，符合條件時推播到 Telegram：
 
@@ -8,8 +8,18 @@
 
 有兩個版本，擇一使用：
 
-- **Google Apps Script 版**（本頁）：設定寫在 Google 試算表
-- **[Cloudflare Workers 版](worker/README.md)**：用 Telegram 指令管理規則，資料存在 D1
+| | [Cloudflare Workers 版](worker/README.md)（推薦） | Google Apps Script 版（本頁下方） |
+|---|---|---|
+| 管理規則 | Telegram 按鈕 / 指令 | Google 試算表 |
+| 檢查頻率 | 每分鐘 | 每 5 分鐘 |
+| 多人共用 | ✅ 申請 / 核准制 | ❌ |
+| 需要 | Cloudflare 帳號、Node.js | Google 帳號 |
+
+👉 **想自己架一套：看 [Workers 版安裝教學](worker/README.md#自己架一套)。**
+
+---
+
+# Google Apps Script 版
 
 ## 安裝
 
