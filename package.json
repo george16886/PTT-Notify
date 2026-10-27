@@ -7,7 +7,7 @@
     "login": "clasp login",
     "push": "clasp push --force",
     "pull": "clasp pull",
-    "deploy": "node scripts/deploy.js"
+    "deploy": ".\\deploy.bat"
   },
   "devDependencies": {
     "@google/clasp": "3.4.1"
