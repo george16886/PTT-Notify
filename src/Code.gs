@@ -127,7 +127,8 @@ function saveSeen_(sheet, keys) {
 function buildRequest_(rule) {
   const q = RULE_TYPES[rule.type](rule.value);
   return {
-    url: `${PTT_BASE}/bbs/${encodeURIComponent(rule.board)}/search?q=${encodeURIComponent(q)}`,
+    // ptt.cc 的 CDN 會把搜尋結果快取很久（實測超過一小時），加時間戳避開快取
+    url: `${PTT_BASE}/bbs/${encodeURIComponent(rule.board)}/search?q=${encodeURIComponent(q)}&_=${Date.now()}`,
     headers: { Cookie: 'over18=1' },
     muteHttpExceptions: true,
   };

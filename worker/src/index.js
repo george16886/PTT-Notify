@@ -172,7 +172,9 @@ function formatSummary(s) {
 
 async function fetchPosts(rule) {
   const q = RULE_TYPES[rule.type](rule.value);
-  const res = await fetch(`${PTT_BASE}/bbs/${encodeURIComponent(rule.board)}/search?q=${encodeURIComponent(q)}`, {
+  // ptt.cc 的 CDN 會把搜尋結果快取很久（實測超過一小時），加時間戳避開快取
+  const url = `${PTT_BASE}/bbs/${encodeURIComponent(rule.board)}/search?q=${encodeURIComponent(q)}&_=${Date.now()}`;
+  const res = await fetch(url, {
     headers: { Cookie: 'over18=1', 'User-Agent': 'ptt-notify (+https://github.com/george16886/PTT-Notify)' },
   });
   if (!res.ok) throw new Error('HTTP ' + res.status);
