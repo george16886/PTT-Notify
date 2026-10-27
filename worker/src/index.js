@@ -32,8 +32,8 @@ const HELP = `<b>PTT Notify</b>
 　類型：關鍵字 / 作者 / 推文數
 　例：<code>/add Stock 關鍵字 台積電</code>
 　　　<code>/add Stock 推文數 50</code>
-/del 編號 — 刪除規則
-/off 編號、/on 編號 — 暫停 / 恢復規則
+/del 序號 — 刪除規則（序號見 /list）
+/off 序號、/on 序號 — 暫停 / 恢復規則
 /check — 立即檢查一次
 
 新規則第一次檢查只記錄現有文章、不通知。`;
@@ -227,34 +227,37 @@ function sendMessage(env, chatId, text, extra = {}) {
   });
 }
 
-/** 規則列表與每條規則的暫停 / 刪除按鈕 */
+const ruleLabel = r => `[${r.board}] ${r.type}: ${r.value}`;
+
+/** 規則列表與每條規則的暫停 / 刪除按鈕；顯示連續序號，按鈕內部用資料庫 id */
 async function renderList(env) {
   const { results } = await env.DB.prepare('SELECT * FROM rules ORDER BY id').all();
   if (!results.length) {
     return { text: '目前沒有規則，按「➕ 新增規則」或用 /add 新增', markup: { inline_keyboard: [] } };
   }
   return {
-    text: results.map(r =>
-      `#${r.id} ${r.enabled ? '✅' : '⏸'} [${esc(r.board)}] ${r.type}: ${esc(r.value)}`).join('\n'),
+    text: results.map((r, i) => `${i + 1}. ${r.enabled ? '✅' : '⏸'} ${esc(ruleLabel(r))}`).join('\n'),
     markup: {
-      inline_keyboard: results.map(r => [
-        { text: `${r.enabled ? '⏸ 暫停' : '▶️ 恢復'} #${r.id}`, callback_data: `toggle:${r.id}` },
-        { text: `🗑 刪除 #${r.id}`, callback_data: `delask:${r.id}` },
+      inline_keyboard: results.map((r, i) => [
+        { text: `${r.enabled ? '⏸ 暫停' : '▶️ 恢復'} ${i + 1}`, callback_data: `toggle:${r.id}` },
+        { text: `🗑 刪除 ${i + 1}`, callback_data: `delask:${r.id}` },
       ]),
     },
   };
 }
 
-/** 刪除 / 恢復 / 暫停規則，回傳是否有找到該規則 */
+/** 刪除 / 恢復 / 暫停規則，回傳該規則（找不到則為 null） */
 async function applyRuleAction(env, action, id) {
+  const rule = await env.DB.prepare('SELECT * FROM rules WHERE id = ?').bind(id).first();
+  if (!rule) return null;
   const sqls = {
     del: ['DELETE FROM rules WHERE id = ?', 'DELETE FROM seen WHERE rule_id = ?'],
     // 恢復時重新「第一次執行」，避免暫停期間累積的文章一次洗版
     on: ['UPDATE rules SET enabled = 1, initialized = 0 WHERE id = ?'],
     off: ['UPDATE rules SET enabled = 0 WHERE id = ?'],
   }[action];
-  const [res] = await env.DB.batch(sqls.map(sql => env.DB.prepare(sql).bind(id)));
-  return res.meta.changes > 0;
+  await env.DB.batch(sqls.map(sql => env.DB.prepare(sql).bind(id)));
+  return rule;
 }
 
 async function handleCallback(cb, env) {
@@ -268,7 +271,7 @@ async function handleCallback(cb, env) {
     await tg(env, 'editMessageReplyMarkup', {
       ...target,
       reply_markup: { inline_keyboard: [[
-        { text: `✅ 確定刪除 #${id}`, callback_data: `del:${id}` },
+        { text: '✅ 確定刪除', callback_data: `del:${id}` },
         { text: '取消', callback_data: 'list' },
       ]] },
     });
@@ -282,7 +285,8 @@ async function handleCallback(cb, env) {
       const rule = await env.DB.prepare('SELECT enabled FROM rules WHERE id = ?').bind(id).first();
       act = rule && rule.enabled ? 'off' : 'on';
     }
-    notice = await applyRuleAction(env, act, id) ? `${ACTION_LABEL[act]} #${id}` : `找不到規則 #${id}`;
+    const rule = await applyRuleAction(env, act, id);
+    notice = rule ? `${ACTION_LABEL[act]} ${ruleLabel(rule)}` : '找不到這條規則，可能已被刪除';
   }
   const view = await renderList(env);
   await tg(env, 'editMessageText', { ...target, text: view.text, parse_mode: 'HTML', reply_markup: view.markup });
@@ -339,10 +343,9 @@ async function handleUpdate(update, env, ctx) {
         return reply(`無法讀取看板 ${esc(board)}（${esc(e.message)}），請確認看板名稱`);
       }
       try {
-        const row = await env.DB
-          .prepare('INSERT INTO rules (board, type, value) VALUES (?, ?, ?) RETURNING id')
-          .bind(board, type, value).first();
-        return reply(`已新增 #${row.id} [${esc(board)}] ${type}: ${esc(value)}`);
+        await env.DB.prepare('INSERT INTO rules (board, type, value) VALUES (?, ?, ?)')
+          .bind(board, type, value).run();
+        return reply(`已新增 ${esc(ruleLabel({ board, type, value }))}`);
       } catch (e) {
         if (String(e.message).includes('UNIQUE')) return reply('這條規則已經存在');
         throw e;
@@ -352,11 +355,14 @@ async function handleUpdate(update, env, ctx) {
     case '/del':
     case '/on':
     case '/off': {
-      const id = parseInt(args[0], 10);
-      if (!id) return reply(`用法：${cmd} 編號（用 /list 查看）`);
+      // 序號 → 資料庫 id（序號即 /list 的排列順序）
+      const pos = parseInt(args[0], 10);
+      if (!(pos >= 1)) return reply(`用法：${cmd} 序號（用 /list 查看）`);
+      const row = await env.DB.prepare('SELECT id FROM rules ORDER BY id LIMIT 1 OFFSET ?').bind(pos - 1).first();
       const action = cmd.slice(1);
-      if (!await applyRuleAction(env, action, id)) return reply(`找不到規則 #${id}`);
-      return reply(`${ACTION_LABEL[action]} #${id}`);
+      const rule = row && await applyRuleAction(env, action, row.id);
+      if (!rule) return reply(`找不到第 ${pos} 條規則`);
+      return reply(`${ACTION_LABEL[action]} ${esc(ruleLabel(rule))}`);
     }
 
     case '/check':
