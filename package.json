@@ -1,0 +1,14 @@
+{
+  "name": "ptt-notify",
+  "private": true,
+  "description": "PTT 看板追蹤通知：Google Apps Script + Telegram",
+  "license": "MIT",
+  "scripts": {
+    "login": "clasp login",
+    "push": "clasp push --force",
+    "pull": "clasp pull"
+  },
+  "devDependencies": {
+    "@google/clasp": "3.4.1"
+  }
+}

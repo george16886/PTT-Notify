@@ -2,7 +2,7 @@
  * PTT Alerter — Google Apps Script + Telegram
  *
  * 追蹤 PTT 看板：標題關鍵字 / 特定作者 / 推文數門檻，符合時推播到 Telegram。
- * 必須建立在 Google Sheet 底下（擴充功能 → Apps Script），設定寫在「設定」工作表。
+ * 可綁定在 Google Sheet 上，或用獨立專案（setup() 會自動建立試算表），設定寫在「設定」工作表。
  *
  * 指令碼屬性（專案設定 → 指令碼屬性）：
  *   TG_TOKEN    Telegram Bot token（向 @BotFather 申請）
