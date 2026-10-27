@@ -88,9 +88,12 @@ export default {
 
 /* ---------- 定時檢查 ---------- */
 
+/** 執行一次檢查，回傳統計（給 /check 的摘要用） */
 async function check(env) {
+  const stats = { rules: 0, sent: 0, sendFailed: 0, initedRules: 0, initedPosts: 0, fetchFailed: [] };
   const { results: rules } = await env.DB.prepare('SELECT * FROM rules WHERE enabled = 1').all();
-  if (!rules.length) return;
+  stats.rules = rules.length;
+  if (!rules.length) return stats;
 
   const { results: seenRows } = await env.DB.prepare('SELECT rule_id, post_id FROM seen').all();
   const seen = new Set(seenRows.map(r => r.rule_id + '#' + r.post_id));
@@ -98,6 +101,7 @@ async function check(env) {
   const lists = await Promise.all(rules.map(rule =>
     fetchPosts(rule).catch(e => {
       console.warn(`抓取失敗 ${rule.board} ${rule.type}=${rule.value}: ${e.message}`);
+      stats.fetchFailed.push(`${ruleLabel(rule)}（${e.message}）`);
       return null;
     })));
 
@@ -112,6 +116,7 @@ async function check(env) {
       if (seen.has(rule.id + '#' + post.id)) return;
       if (!rule.initialized) {
         newSeen.push([rule.id, post.id]);
+        stats.initedPosts++;
         return;
       }
       const hit = hits.get(post.id) || { post, board: rule.board, reasons: [], ruleIds: [] };
@@ -127,8 +132,12 @@ async function check(env) {
   for (const hit of sorted) {
     if (await sendMessage(env, env.TG_CHAT_ID, formatPost(hit))) {
       hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
+      stats.sent++;
+    } else {
+      stats.sendFailed++;
     }
   }
+  stats.initedRules = inited.length;
 
   const now = Date.now();
   const stmts = [
@@ -137,7 +146,7 @@ async function check(env) {
       .bind(ruleId, postId, now)),
     ...inited.map(id => env.DB.prepare('UPDATE rules SET initialized = 1 WHERE id = ?').bind(id)),
   ];
-  if (!stmts.length) return;
+  if (!stmts.length) return stats;
   // 每條規則只保留最新的 N 筆（文章 id 含時間戳，可直接排序）
   stmts.push(env.DB.prepare(`
     DELETE FROM seen WHERE rowid IN (
@@ -146,6 +155,17 @@ async function check(env) {
       ) WHERE rn > ?
     )`).bind(SEEN_KEEP_PER_RULE));
   await env.DB.batch(stmts);
+  return stats;
+}
+
+function formatSummary(s) {
+  if (!s.rules) return 'ℹ️ 目前沒有啟用中的規則';
+  const ok = !s.fetchFailed.length && !s.sendFailed;
+  const lines = [`${ok ? '✅' : '⚠️'} 檢查完成：${s.rules} 條規則，${s.sent ? `${s.sent} 篇新文章` : '沒有新文章'}`];
+  if (s.initedRules) lines.push(`新規則 ${s.initedRules} 條已記錄現有 ${s.initedPosts} 篇（不通知）`);
+  s.fetchFailed.forEach(f => lines.push('抓取失敗：' + esc(f)));
+  if (s.sendFailed) lines.push(`通知傳送失敗 ${s.sendFailed} 則，下次檢查會重試`);
+  return lines.join('\n');
 }
 
 /* ---------- PTT ---------- */
@@ -366,8 +386,11 @@ async function handleUpdate(update, env, ctx) {
     }
 
     case '/check':
-      ctx.waitUntil(check(env));
-      return reply('開始檢查…');
+      await reply('開始檢查…');
+      ctx.waitUntil(check(env)
+        .then(stats => reply(formatSummary(stats)))
+        .catch(e => reply('❌ 檢查失敗：' + esc(e.message))));
+      return;
 
     default:
       return reply('不認得的指令，輸入 /help 查看用法');
