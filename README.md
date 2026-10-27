@@ -1,4 +1,4 @@
-# PTT Alerter（Google Apps Script + Telegram）
+# PTT Notify（Google Apps Script + Telegram）
 
 追蹤 PTT 看板，符合條件時推播到 Telegram：
 
@@ -10,7 +10,7 @@
 
 1. **建立 Telegram Bot**：在 Telegram 找 `@BotFather` → `/newbot`，記下 token。
 2. **建立專案**：新增一個空白試算表 → 擴充功能 → Apps Script。
-   （也可以在 script.google.com 直接建獨立專案，`setup` 會自動建立一個「PTT Alerter」試算表，網址印在執行紀錄裡。）
+   （也可以在 script.google.com 直接建獨立專案，`setup` 會自動建立一個「PTT Notify」試算表，網址印在執行紀錄裡。）
 3. **貼上程式**：把 `src/Code.gs` 的內容貼進編輯器並存檔。
    （選用）專案設定 → 勾選「在編輯器中顯示 appsscript.json」，貼上 `src/appsscript.json` 讓時區為台北。
    也可以用 clasp 從本機推送，見下方[用 clasp 部署](#用-clasp-部署)。

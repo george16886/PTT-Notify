@@ -1,5 +1,5 @@
 /**
- * PTT Alerter — Google Apps Script + Telegram
+ * PTT Notify — Google Apps Script + Telegram
  *
  * 追蹤 PTT 看板：標題關鍵字 / 特定作者 / 推文數門檻，符合時推播到 Telegram。
  * 可綁定在 Google Sheet 上，或用獨立專案（setup() 會自動建立試算表），設定寫在「設定」工作表。
@@ -207,7 +207,7 @@ function setup() {
   let ss = SpreadsheetApp.getActive();
   if (!ss && props.getProperty('SHEET_ID')) ss = SpreadsheetApp.openById(props.getProperty('SHEET_ID'));
   if (!ss) {
-    ss = SpreadsheetApp.create('PTT Alerter');
+    ss = SpreadsheetApp.create('PTT Notify');
     props.setProperty('SHEET_ID', ss.getId());
   }
   let config = ss.getSheetByName(CONFIG_SHEET);
@@ -255,7 +255,7 @@ function getChatId() {
 }
 
 function sendTestMessage() {
-  console.log(sendTelegram_('✅ PTT Alerter 測試訊息') ? '已送出' : '失敗，請看 log');
+  console.log(sendTelegram_('✅ PTT Notify 測試訊息') ? '已送出' : '失敗，請看 log');
 }
 
 /** 清除所有紀錄（重新開始時用） */
