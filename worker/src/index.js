@@ -16,6 +16,8 @@
 const PTT_BASE = 'https://www.ptt.cc';
 const SEEN_KEEP_PER_RULE = 100;   // 每條規則保留的已通知紀錄數
 const MAX_RULES_PER_USER = 10;    // 一般使用者的規則上限（管理員不限）
+// 可選的檢查間隔（分鐘），都能整除 60，排程每分鐘觸發時以「分鐘數 % 間隔」判斷是否輪到
+const INTERVALS = [1, 2, 5, 10, 15, 30, 60];
 
 // 類型 → PTT 搜尋語法
 const RULE_TYPES = {
@@ -39,23 +41,25 @@ const HELP = `<b>PTT Notify</b>
 /del 序號 — 刪除規則（序號見 /list）
 /off 序號、/on 序號 — 暫停 / 恢復規則
 /check — 立即檢查一次
+/interval — 設定自動檢查頻率
 
 新規則第一次檢查只記錄現有文章、不通知。`;
-const ADMIN_HELP = `\n\n<b>管理員</b>\n/users — 管理使用者（核准 / 停用）`;
+const ADMIN_HELP = `\n\n<b>管理員</b>\n/users — 管理使用者（核准 / 停用、檢查頻率下限）`;
 
 // 常駐選單按鈕 → 對應指令
 const MENU = {
   '📋 規則列表': '/list',
   '➕ 新增規則': '/add',
   '🔄 立即檢查': '/check',
+  '⏱ 檢查頻率': '/interval',
   '❓ 說明': '/help',
   '👥 使用者': '/users',
 };
 const keyboard = admin => ({
   keyboard: [
     [{ text: '📋 規則列表' }, { text: '➕ 新增規則' }],
-    [{ text: '🔄 立即檢查' }, { text: '❓ 說明' }],
-    ...(admin ? [[{ text: '👥 使用者' }]] : []),
+    [{ text: '🔄 立即檢查' }, { text: '⏱ 檢查頻率' }],
+    [{ text: '❓ 說明' }, ...(admin ? [{ text: '👥 使用者' }] : [])],
   ],
   resize_keyboard: true,
   is_persistent: true,
@@ -65,6 +69,7 @@ const COMMANDS = [
   { command: 'list', description: '列出規則' },
   { command: 'add', description: '新增規則' },
   { command: 'check', description: '立即檢查一次' },
+  { command: 'interval', description: '設定檢查頻率' },
   { command: 'help', description: '說明' },
 ];
 const ADMIN_COMMANDS = [...COMMANDS, { command: 'users', description: '管理使用者' }];
@@ -74,7 +79,7 @@ const ACTION_LABEL = { del: '已刪除', on: '已恢復', off: '已暫停' };
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(check(env));
+    ctx.waitUntil(check(env, { now: event.scheduledTime }));
   },
 
   async fetch(request, env, ctx) {
@@ -102,7 +107,7 @@ async function setup(env, url) {
   if (!/^[A-Za-z0-9_-]{1,256}$/.test(secret)) {
     return new Response('TG_WEBHOOK_SECRET 只能包含英數字、_、-，請重新設定', { status: 400 });
   }
-  await adoptOrphanRules(env);
+  await ensureAdmin(env);
   const result = {
     setWebhook: await tg(env, 'setWebhook', {
       url: `${url.origin}/telegram`, secret_token: secret, allowed_updates: ['message', 'callback_query'],
@@ -125,9 +130,42 @@ async function hasAccess(env, chatId) {
   return user?.status === 'allowed';
 }
 
-/** 舊版（單人）留下沒有擁有者的規則，歸給管理員 */
-function adoptOrphanRules(env) {
-  return env.DB.prepare('UPDATE rules SET chat_id = ? WHERE chat_id IS NULL').bind(String(env.TG_CHAT_ID)).run();
+/** 確保管理員在 users 有一列（存檢查間隔），並把舊版（單人）沒有擁有者的規則歸給管理員 */
+function ensureAdmin(env) {
+  const admin = String(env.TG_CHAT_ID);
+  return env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO users (chat_id, name, status, interval_min, min_interval)
+      VALUES (?, '管理員', 'admin', 1, 1)`).bind(admin),
+    env.DB.prepare('UPDATE rules SET chat_id = ? WHERE chat_id IS NULL').bind(admin),
+  ]);
+}
+
+const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+
+/** 使用者自己的檢查頻率設定畫面（只能選管理員設定的下限以上） */
+async function renderInterval(env, chatId) {
+  const u = await env.DB.prepare('SELECT interval_min, min_interval FROM users WHERE chat_id = ?').bind(chatId).first();
+  const limit = u.min_interval > 1 ? `（管理員設定最快 ${u.min_interval} 分鐘）` : '';
+  return {
+    text: `⏱ 目前每 ${u.interval_min} 分鐘自動檢查一次${limit}\n選擇新的檢查頻率：`,
+    markup: {
+      inline_keyboard: chunk(INTERVALS.filter(n => n >= u.min_interval).map(n => ({
+        text: `${n === u.interval_min ? '✓ ' : ''}${n} 分`, callback_data: `interval:${n}`,
+      })), 4),
+    },
+  };
+}
+
+/** 管理員設定某位使用者的檢查頻率下限；使用者目前的間隔比下限快時一併調慢 */
+async function setMinInterval(env, chatId, minutes) {
+  const user = await env.DB.prepare(`
+    UPDATE users SET min_interval = ?, interval_min = MAX(interval_min, ?)
+    WHERE chat_id = ? AND status != 'admin' RETURNING *`).bind(minutes, minutes, chatId).first();
+  if (user) {
+    await sendMessage(env, chatId,
+      `⏱ 管理員將你的最快檢查頻率設為 ${minutes} 分鐘，目前每 ${user.interval_min} 分鐘檢查一次`);
+  }
+  return user;
 }
 
 function chatName(chat) {
@@ -151,7 +189,7 @@ async function requestAccess(env, chat) {
 
 /** 變更使用者狀態，回傳使用者（找不到則為 null） */
 async function setUserStatus(env, chatId, status) {
-  const user = await env.DB.prepare('UPDATE users SET status = ? WHERE chat_id = ? RETURNING *')
+  const user = await env.DB.prepare(`UPDATE users SET status = ? WHERE chat_id = ? AND status != 'admin' RETURNING *`)
     .bind(status, chatId).first();
   if (user && status === 'allowed') {
     await sendMessage(env, chatId, '✅ 管理員已核准，傳 /start 開始使用');
@@ -162,33 +200,46 @@ async function setUserStatus(env, chatId, status) {
 async function renderUsers(env) {
   const { results } = await env.DB.prepare(`
     SELECT u.*, (SELECT COUNT(*) FROM rules r WHERE r.chat_id = u.chat_id) AS rule_count
-    FROM users u ORDER BY u.created_at`).all();
+    FROM users u WHERE u.status != 'admin' ORDER BY u.created_at`).all();
   if (!results.length) return { text: '目前沒有其他使用者', markup: { inline_keyboard: [] } };
   const icon = { pending: '⏳', allowed: '✅', blocked: '⛔' };
   return {
-    text: results.map((u, i) =>
-      `${i + 1}. ${icon[u.status] || '❔'} ${esc(u.name)}（${u.rule_count} 條規則）`).join('\n'),
+    text: results.map((u, i) => `${i + 1}. ${icon[u.status] || '❔'} ${esc(u.name)}`
+      + `（${u.rule_count} 條規則，每 ${u.interval_min} 分／最快 ${u.min_interval} 分）`).join('\n'),
     markup: {
-      inline_keyboard: results.map((u, i) => [u.status === 'allowed'
-        ? { text: `⛔ 停用 ${i + 1}`, callback_data: `block:${u.chat_id}` }
-        : { text: `✅ 核准 ${i + 1}`, callback_data: `allow:${u.chat_id}` }]),
+      inline_keyboard: results.map((u, i) => [
+        u.status === 'allowed'
+          ? { text: `⛔ 停用 ${i + 1}`, callback_data: `block:${u.chat_id}` }
+          : { text: `✅ 核准 ${i + 1}`, callback_data: `allow:${u.chat_id}` },
+        { text: `⏱ 下限 ${i + 1}`, callback_data: `minask:${u.chat_id}` },
+      ]),
     },
   };
 }
 
 /* ---------- 定時檢查 ---------- */
 
-/** 執行一次檢查；有指定 focusChat 時回傳該 chat 的統計（給 /check 的摘要用） */
-async function check(env, focusChat = null) {
+/**
+ * 執行一次檢查，回傳統計（給 /check 的摘要用）。
+ * 定時觸發：只檢查這一分鐘輪到的使用者（分鐘數 % 間隔 = 0）；/check：只檢查指定的 chat。
+ */
+async function check(env, { chat = null, now = Date.now() } = {}) {
   const stats = { rules: 0, sent: 0, sendFailed: 0, initedRules: 0, initedPosts: 0, fetchFailed: [] };
-  const mine = rule => rule.chat_id === focusChat;
 
-  await adoptOrphanRules(env);
+  await ensureAdmin(env);
   // 管理員與已核准使用者的規則
-  const { results: rules } = await env.DB.prepare(`
-    SELECT r.* FROM rules r LEFT JOIN users u ON u.chat_id = r.chat_id
-    WHERE r.enabled = 1 AND (r.chat_id = ? OR u.status = 'allowed')`).bind(String(env.TG_CHAT_ID)).all();
-  stats.rules = rules.filter(mine).length;
+  let sql = `SELECT r.* FROM rules r JOIN users u ON u.chat_id = r.chat_id
+    WHERE r.enabled = 1 AND u.status IN ('allowed', 'admin')`;
+  const binds = [];
+  if (chat) {
+    sql += ' AND r.chat_id = ?';
+    binds.push(chat);
+  } else {
+    sql += ' AND ? % u.interval_min = 0';
+    binds.push(Math.round(now / 60000));
+  }
+  const { results: rules } = await env.DB.prepare(sql).bind(...binds).all();
+  stats.rules = rules.length;
   if (!rules.length) return stats;
 
   const { results: seenRows } = await env.DB.prepare('SELECT rule_id, post_id FROM seen').all();
@@ -211,7 +262,7 @@ async function check(env, focusChat = null) {
     const list = lists.get(queryKey(rule));
     if (list.error) {
       console.warn(`抓取失敗 ${rule.board} ${rule.type}=${rule.value}: ${list.error}`);
-      if (mine(rule)) stats.fetchFailed.push(`${ruleLabel(rule)}（${list.error}）`);
+      stats.fetchFailed.push(`${ruleLabel(rule)}（${list.error}）`);
       return;
     }
     list.forEach(post => {
@@ -219,7 +270,7 @@ async function check(env, focusChat = null) {
       if (seen.has(rule.id + '#' + post.id)) return;
       if (!rule.initialized) {
         newSeen.push([rule.id, post.id]);
-        if (mine(rule)) stats.initedPosts++;
+        stats.initedPosts++;
         return;
       }
       const key = rule.chat_id + '#' + post.id;
@@ -230,19 +281,21 @@ async function check(env, focusChat = null) {
     });
     if (!rule.initialized) {
       inited.push(rule.id);
-      if (mine(rule)) stats.initedRules++;
+      stats.initedRules++;
     }
   });
 
   // 依發文時間排序，舊的先送
   const sorted = [...hits.values()].sort((a, b) => a.post.id.localeCompare(b.post.id));
   for (const hit of sorted) {
-    const ok = await sendMessage(env, hit.chatId, formatPost(hit));
-    if (ok) hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
-    if (hit.chatId === focusChat) ok ? stats.sent++ : stats.sendFailed++;
+    if (await sendMessage(env, hit.chatId, formatPost(hit))) {
+      hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
+      stats.sent++;
+    } else {
+      stats.sendFailed++;
+    }
   }
 
-  const now = Date.now();
   const stmts = [
     ...newSeen.map(([ruleId, postId]) => env.DB
       .prepare('INSERT OR IGNORE INTO seen (rule_id, post_id, created_at) VALUES (?, ?, ?)')
@@ -393,9 +446,36 @@ async function handleCallback(cb, env) {
   const msg = cb.message;
   if (!msg) return;
   const chatId = String(msg.chat.id);
-  const [action, arg] = (cb.data || '').split(':');
+  const [action, arg, arg2] = (cb.data || '').split(':');
   const target = { chat_id: msg.chat.id, message_id: msg.message_id };
   const answer = (text = '') => tg(env, 'answerCallbackQuery', { callback_query_id: cb.id, text });
+  const showUsers = async () => {
+    const view = await renderUsers(env);
+    await tg(env, 'editMessageText', { ...target, text: view.text, parse_mode: 'HTML', reply_markup: view.markup });
+  };
+
+  // 管理員：設定使用者的檢查頻率下限
+  if (action === 'minask' || action === 'minset' || action === 'users') {
+    if (!isAdmin(env, chatId)) return answer();
+    if (action === 'minask') {
+      await tg(env, 'editMessageReplyMarkup', {
+        ...target,
+        reply_markup: { inline_keyboard: [
+          ...chunk(INTERVALS.map(n => ({ text: `最快 ${n} 分`, callback_data: `minset:${arg}:${n}` })), 4),
+          [{ text: '取消', callback_data: 'users' }],
+        ] },
+      });
+      return answer('選擇這位使用者最快可以多久檢查一次');
+    }
+    let notice = '';
+    if (action === 'minset') {
+      const minutes = Number(arg2);
+      const user = INTERVALS.includes(minutes) && await setMinInterval(env, arg, minutes);
+      notice = user ? `${user.name}：最快 ${minutes} 分鐘` : '找不到這位使用者';
+    }
+    await showUsers();
+    return answer(notice);
+  }
 
   // 管理員：核准 / 停用使用者（申請通知或使用者列表上的按鈕）
   if (action === 'allow' || action === 'block') {
@@ -405,13 +485,25 @@ async function handleCallback(cb, env) {
     if ((msg.text || '').startsWith('🙋')) {
       await tg(env, 'editMessageText', { ...target, text: `${msg.text}\n\n${result}` });
     } else {
-      const view = await renderUsers(env);
-      await tg(env, 'editMessageText', { ...target, text: view.text, parse_mode: 'HTML', reply_markup: view.markup });
+      await showUsers();
     }
     return answer(result);
   }
 
   if (!await hasAccess(env, chatId)) return answer();
+
+  // 使用者：設定自己的檢查頻率（不能比管理員設定的下限快）
+  if (action === 'interval') {
+    const minutes = Number(arg);
+    const user = INTERVALS.includes(minutes) && await env.DB.prepare(`
+      UPDATE users SET interval_min = ? WHERE chat_id = ? AND min_interval <= ? RETURNING *`)
+      .bind(minutes, chatId, minutes).first();
+    const notice = user ? `已改為每 ${minutes} 分鐘檢查一次` : '無法設定這個頻率';
+    const view = await renderInterval(env, chatId);
+    await tg(env, 'editMessageText', { ...target, text: view.text, reply_markup: view.markup });
+    return answer(notice);
+  }
+
   const id = Number(arg);
 
   if (action === 'delask') {
@@ -448,7 +540,9 @@ async function handleUpdate(update, env, ctx) {
   const admin = isAdmin(env, chatId);
   const reply = (text, extra) => sendMessage(env, chatId, text, extra);
 
-  if (!admin) {
+  if (admin) {
+    await ensureAdmin(env);
+  } else {
     const user = await env.DB.prepare('SELECT status FROM users WHERE chat_id = ?').bind(chatId).first();
     if (!user) return requestAccess(env, msg.chat);
     if (user.status === 'pending') return reply('⏳ 申請審核中，請等待管理員核准');
@@ -477,6 +571,11 @@ async function handleUpdate(update, env, ctx) {
     case '/users': {
       if (!admin) return reply('不認得的指令，輸入 /help 查看用法');
       const view = await renderUsers(env);
+      return reply(view.text, { reply_markup: view.markup });
+    }
+
+    case '/interval': {
+      const view = await renderInterval(env, chatId);
       return reply(view.text, { reply_markup: view.markup });
     }
 
@@ -530,7 +629,7 @@ async function handleUpdate(update, env, ctx) {
 
     case '/check':
       await reply('開始檢查…');
-      ctx.waitUntil(check(env, chatId)
+      ctx.waitUntil(check(env, { chat: chatId })
         .then(stats => reply(formatSummary(stats)))
         .catch(e => reply('❌ 檢查失敗：' + esc(e.message))));
       return;
