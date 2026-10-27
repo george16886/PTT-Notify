@@ -611,7 +611,8 @@ async function handleUpdate(update, env, ctx) {
       try {
         await fetchPosts({ board, type, value });
       } catch (e) {
-        return reply(`無法讀取看板 ${esc(board)}（${esc(e.message)}），請確認看板名稱`);
+        if (e.message === 'HTTP 404') return reply(`找不到看板 ${esc(board)}，請確認看板名稱（大小寫也要一致）`);
+        return reply(`PTT 暫時無法連線（${esc(e.message)}），請稍後再試`);
       }
       try {
         await env.DB.prepare('INSERT INTO rules (chat_id, board, type, value) VALUES (?, ?, ?, ?)')
