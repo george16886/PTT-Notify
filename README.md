@@ -6,6 +6,11 @@
 - **作者**：指定 ID 發文
 - **推文數**：推文數 ≥ 指定數字（`爆` = 100）
 
+有兩個版本，擇一使用：
+
+- **Google Apps Script 版**（本頁）：設定寫在 Google 試算表
+- **[Cloudflare Workers 版](worker/README.md)**：用 Telegram 指令管理規則，資料存在 D1
+
 ## 安裝
 
 1. **建立 Telegram Bot**：在 Telegram 找 `@BotFather` → `/newbot`，記下 token。

@@ -1,0 +1,15 @@
+{
+  "name": "ptt-notify-worker",
+  "private": true,
+  "description": "PTT 看板追蹤通知：Cloudflare Workers + D1 + Telegram",
+  "license": "MIT",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "db:migrate": "wrangler d1 migrations apply ptt-notify --remote",
+    "db:migrate:local": "wrangler d1 migrations apply ptt-notify --local"
+  },
+  "devDependencies": {
+    "wrangler": "4.153.0"
+  }
+}
