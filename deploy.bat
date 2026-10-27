@@ -39,7 +39,7 @@ set EXITCODE=1
 :end
 chcp %OLDCP% >nul
 rem 雙擊執行時暫停，讓視窗不會馬上關掉（從 npm 或已開啟的命令列執行則不暫停）
-if not defined npm_lifecycle_event (
-  echo %cmdcmdline% | find /i "/c" >nul && pause
-)
+setlocal EnableDelayedExpansion
+set "CL=!cmdcmdline!"
+if not defined npm_lifecycle_event if /i not "!CL:/c=!"=="!CL!" pause
 exit /b %EXITCODE%
