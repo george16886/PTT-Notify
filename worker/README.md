@@ -113,6 +113,10 @@ npm run deploy
 記下輸出的網址，例如 `https://ptt-notify.<你的子網域>.workers.dev`。
 第一次部署若提示要註冊 workers.dev 子網域，到 Cloudflare 後台 Workers & Pages 設定一個即可。
 
+### （選用）設定 bot 頭像
+
+到 @BotFather 傳 `/setuserpic`，選擇你的 bot，上傳 [`assets/logo.png`](../assets/logo.png)（以「照片」傳送，不要用檔案）。
+
 ### 6. 連接 Telegram
 
 用瀏覽器打開（換成你的網址和 `TG_WEBHOOK_SECRET`）：

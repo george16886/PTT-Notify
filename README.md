@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/logo.png" width="160" alt="PTT Notify logo"></p>
+
 # PTT Notify
 
 追蹤 PTT 看板，符合條件時推播到 Telegram：
