@@ -9,8 +9,8 @@
     {
       "binding": "DB",
       "database_name": "ptt-notify",
-      // 執行 npx wrangler d1 create ptt-notify 後填入
-      "database_id": "REPLACE_WITH_DATABASE_ID",
+      // npx wrangler d1 create ptt-notify 的輸出
+      "database_id": "056a03ed-4a4b-4506-b414-93610b7d0ea8",
       "migrations_dir": "migrations"
     }
   ],
