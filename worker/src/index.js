@@ -207,12 +207,15 @@ async function renderUsers(env) {
     text: results.map((u, i) => `${i + 1}. ${icon[u.status] || '❔'} ${esc(u.name)}`
       + `（${u.rule_count} 條規則，每 ${u.interval_min} 分／最快 ${u.min_interval} 分）`).join('\n'),
     markup: {
-      inline_keyboard: results.map((u, i) => [
-        u.status === 'allowed'
-          ? { text: `⛔ 停用 ${i + 1}`, callback_data: `block:${u.chat_id}` }
-          : { text: `✅ 核准 ${i + 1}`, callback_data: `allow:${u.chat_id}` },
-        { text: `⏱ 下限 ${i + 1}`, callback_data: `minask:${u.chat_id}` },
-      ]),
+      inline_keyboard: results.map(u => {
+        const name = u.name.length > 10 ? u.name.slice(0, 10) + '…' : u.name;
+        return [
+          u.status === 'allowed'
+            ? { text: `⛔ 停用 ${name}`, callback_data: `block:${u.chat_id}` }
+            : { text: `✅ 核准 ${name}`, callback_data: `allow:${u.chat_id}` },
+          { text: `⏱ 最快 ${u.min_interval} 分`, callback_data: `minask:${u.chat_id}` },
+        ];
+      }),
     },
   };
 }
