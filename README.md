@@ -63,9 +63,12 @@
 之後修改程式：
 
 ```sh
-npm run push   # 推到 Apps Script
-git push       # 推到 GitHub
+git commit ...
+npm run deploy   # src/ 有變動會先推到 Apps Script，再 git push
 ```
+
+`npm run deploy` 會檢查待推送的 commit 是否改到 `src/`：有就先 `clasp push` 再 `git push`，沒有就直接 `git push`。
+`src/` 有未 commit 的修改時會中止。也可以分開執行 `npm run push`（只推 Apps Script）與 `git push`。
 
 注意：`clasp push` 會**覆蓋整個專案**，線上編輯器的修改會被蓋掉，請一律改 repo 裡的檔案。
 登入憑證 `~/.clasprc.json` 等同你的 Google 帳號權限，不要外流或 commit。

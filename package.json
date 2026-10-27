@@ -6,7 +6,8 @@
   "scripts": {
     "login": "clasp login",
     "push": "clasp push --force",
-    "pull": "clasp pull"
+    "pull": "clasp pull",
+    "deploy": "node scripts/deploy.js"
   },
   "devDependencies": {
     "@google/clasp": "3.4.1"
