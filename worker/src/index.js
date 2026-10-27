@@ -79,7 +79,10 @@ const ACTION_LABEL = { del: '已刪除', on: '已恢復', off: '已暫停' };
 
 export default {
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(check(env, { now: event.scheduledTime }));
+    ctx.waitUntil((async () => {
+      await check(env, { now: event.scheduledTime });
+      if (Math.round(event.scheduledTime / 60000) % 60 === 0) await pruneSeen(env); // 整點清理
+    })());
   },
 
   async fetch(request, env, ctx) {
@@ -230,22 +233,24 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
   const stats = { rules: 0, sent: 0, sendFailed: 0, initedRules: 0, initedPosts: 0, fetchFailed: [] };
 
   await ensureAdmin(env);
-  // 管理員與已核准使用者的規則
-  let sql = `SELECT r.* FROM rules r JOIN users u ON u.chat_id = r.chat_id
-    WHERE r.enabled = 1 AND u.status IN ('allowed', 'admin')`;
+  // 這次要檢查的規則：管理員與已核准使用者，且是指定的 chat 或這一分鐘輪到的使用者
+  let filter = `JOIN users u ON u.chat_id = r.chat_id WHERE r.enabled = 1 AND u.status IN ('allowed', 'admin')`;
   const binds = [];
   if (chat) {
-    sql += ' AND r.chat_id = ?';
+    filter += ' AND r.chat_id = ?';
     binds.push(chat);
   } else {
-    sql += ' AND ? % u.interval_min = 0';
+    filter += ' AND ? % u.interval_min = 0';
     binds.push(Math.round(now / 60000));
   }
-  const { results: rules } = await env.DB.prepare(sql).bind(...binds).all();
+  const { results: rules } = await env.DB.prepare(`SELECT r.* FROM rules r ${filter}`).bind(...binds).all();
   stats.rules = rules.length;
   if (!rules.length) return stats;
 
-  const { results: seenRows } = await env.DB.prepare('SELECT rule_id, post_id FROM seen').all();
+  // 只讀這些規則的已通知紀錄（透過 seen 的主鍵索引，不掃整張表）
+  const { results: seenRows } = await env.DB.prepare(
+    `SELECT s.rule_id, s.post_id FROM rules r ${filter.replace('WHERE', 'JOIN seen s ON s.rule_id = r.id WHERE')}`,
+  ).bind(...binds).all();
   const seen = new Set(seenRows.map(r => r.rule_id + '#' + r.post_id));
 
   // 相同的搜尋條件（不同使用者）只抓一次
@@ -305,16 +310,18 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
       .bind(ruleId, postId, now)),
     ...inited.map(id => env.DB.prepare('UPDATE rules SET initialized = 1 WHERE id = ?').bind(id)),
   ];
-  if (!stmts.length) return stats;
-  // 每條規則只保留最新的 N 筆（文章 id 含時間戳，可直接排序）
-  stmts.push(env.DB.prepare(`
+  if (stmts.length) await env.DB.batch(stmts);
+  return stats;
+}
+
+/** 每條規則只保留最新的 N 筆已通知紀錄（文章 id 含時間戳，可直接排序）；會掃整張表，每小時跑一次 */
+function pruneSeen(env) {
+  return env.DB.prepare(`
     DELETE FROM seen WHERE rowid IN (
       SELECT rowid FROM (
         SELECT rowid, ROW_NUMBER() OVER (PARTITION BY rule_id ORDER BY post_id DESC) AS rn FROM seen
       ) WHERE rn > ?
-    )`).bind(SEEN_KEEP_PER_RULE));
-  await env.DB.batch(stmts);
-  return stats;
+    )`).bind(SEEN_KEEP_PER_RULE).run();
 }
 
 function formatSummary(s) {
