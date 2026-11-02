@@ -14,9 +14,12 @@
  */
 
 const PTT_BASE = 'https://www.ptt.cc';
+const USER_AGENT = 'ptt-notify (+https://github.com/george16886/PTT-Notify)';
 const SEEN_KEEP_PER_RULE = 100;   // 每條規則保留的已通知紀錄數
 const MAX_RULES_PER_USER = 10;    // 一般使用者的規則上限（管理員不限）
-const MAX_NOTIFY_PER_RUN = 10;    // 每次執行最多送出的通知數，其餘下次再送（受每次 50 個對外請求限制）
+// 每次執行最多送出的通知數，其餘下次再送。每則最多 3 個對外請求（文章、相簿頁、Telegram），
+// 加上搜尋 PTT 的請求，需低於每次執行 50 個的上限
+const MAX_NOTIFY_PER_RUN = 8;
 const EXCERPT_LENGTH = 150;       // 通知中內文摘錄的字數
 // 可選的檢查間隔（分鐘），都能整除 60，排程每分鐘觸發時以「分鐘數 % 間隔」判斷是否輪到
 const INTERVALS = [1, 2, 5, 10, 15, 30, 60];
@@ -303,12 +306,17 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
   // 抓內文摘錄與縮圖（同一篇文章只抓一次；失敗就只送標題）
   const articles = new Map();
   batch.forEach(({ post }) => {
-    if (!articles.has(post.id)) articles.set(post.id, fetchArticle(post.url).catch(() => null));
+    if (articles.has(post.id)) return;
+    articles.set(post.id, fetchArticle(post.url).then(async article => {
+      // 沒有圖片檔、只有相簿 / 分享頁連結時，讀出頁面的 og:image；讀不到就不顯示預覽
+      if (!article.image && article.link) article.image = await fetchPageImage(article.link).catch(() => null);
+      if (article.image) article.image = previewableImage(article.image);
+      return article;
+    }).catch(() => null));
   });
   for (const hit of batch) {
     const article = await articles.get(hit.post.id);
-    const previewUrl = article?.image || article?.link;
-    const preview = previewUrl ? { link_preview_options: { url: previewUrl, prefer_large_media: true } } : {};
+    const preview = article?.image ? { link_preview_options: { url: article.image, prefer_large_media: true } } : {};
     if (await sendMessage(env, hit.chatId, formatPost(hit, article), preview)) {
       hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
       stats.sent++;
@@ -355,7 +363,7 @@ async function fetchPosts(rule) {
   // ptt.cc 的 CDN 會把搜尋結果快取很久（實測超過一小時），加時間戳避開快取
   const url = `${PTT_BASE}/bbs/${encodeURIComponent(rule.board)}/search?q=${encodeURIComponent(q)}&_=${Date.now()}`;
   const res = await fetch(url, {
-    headers: { Cookie: 'over18=1', 'User-Agent': 'ptt-notify (+https://github.com/george16886/PTT-Notify)' },
+    headers: { Cookie: 'over18=1', 'User-Agent': USER_AGENT },
   });
   if (!res.ok) throw new Error('HTTP ' + res.status);
   return parseList(await res.text());
@@ -386,11 +394,26 @@ function parseList(html) {
 
 async function fetchArticle(url) {
   const res = await fetch(url, {
-    headers: { Cookie: 'over18=1', 'User-Agent': 'ptt-notify (+https://github.com/george16886/PTT-Notify)' },
+    headers: { Cookie: 'over18=1', 'User-Agent': USER_AGENT },
     signal: AbortSignal.timeout(10000),
   });
   if (!res.ok) throw new Error('HTTP ' + res.status);
   return parseArticle(await res.text());
+}
+
+/** 讀出網頁的預覽圖（og:image / twitter:image），用於 ImgBB、pCloud 等相簿分享頁 */
+async function fetchPageImage(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': USER_AGENT }, signal: AbortSignal.timeout(8000) });
+  if (!res.ok) return null;
+  const tag = (await res.text()).match(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]*>/i);
+  const content = tag && (tag[0].match(/content=["']([^"']+)["']/i) || [])[1];
+  return content ? new URL(decodeEntities(content), url).href : null;
+}
+
+/** Telegram 連結預覽不支援的圖片格式（如 ImgBB 的 AVIF），透過 wsrv.nl 轉成 JPG */
+function previewableImage(url) {
+  if (!/\.(?:avif|heic|heif|bmp|tiff?)(?:$|[?#])/i.test(url)) return url;
+  return `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=jpg&w=1280&we`;
 }
 
 /** 解析文章頁：內文開頭摘錄（不含標頭、簽名檔、推文）與內文中的第一張圖片 */
