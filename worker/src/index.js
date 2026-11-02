@@ -307,9 +307,8 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
   });
   for (const hit of batch) {
     const article = await articles.get(hit.post.id);
-    const preview = article?.image
-      ? { link_preview_options: { url: article.image, prefer_large_media: true } }
-      : {};
+    const previewUrl = article?.image || article?.link;
+    const preview = previewUrl ? { link_preview_options: { url: previewUrl, prefer_large_media: true } } : {};
     if (await sendMessage(env, hit.chatId, formatPost(hit, article), preview)) {
       hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
       stats.sent++;
@@ -403,10 +402,13 @@ function parseArticle(html) {
   const img = (body.match(/<div class="richcontent"><img src="([^"]+)"/) || [])[1]
     || (body.match(/https?:\/\/[^\s"<>]+\.(?:jpe?g|png|gif|webp)\b/i) || [])[0];
   const image = img && (img.startsWith('//') ? 'https:' + img : img).replace(/^http:/, 'https:');
+  // 沒有圖片檔時，用第一個站外連結當預覽（如 pCloud、Google 相簿分享頁，Telegram 會讀頁面的 og:image）
+  const link = !image && [...body.matchAll(/<a href="(https?:\/\/[^"]+)"/g)]
+    .map(m => decodeEntities(m[1])).find(u => !/^https?:\/\/(?:[\w-]+\.)*ptt\.cc\//.test(u));
 
   const text = decodeEntities(body.replace(/<div class="richcontent">[\s\S]*?<\/div>/g, '').replace(/<[^>]+>/g, ''))
     .split(/\n--\n/)[0]                                                      // 簽名檔
-    .replace(/https?:\/\/[^\s"<>]+\.(?:jpe?g|png|gif|webp)\b/gi, '');       // 圖片網址改用縮圖顯示
+    .replace(/https?:\/\/[^\s<>]+/g, '');                                   // 網址太佔字數（圖片改用縮圖，全文點標題）
   let lines = text.split('\n').map(l => l.trim());
   // 發文範本的說明（如「----(以上看完後 請按CTRL+y刪除)----」）沒刪掉時，從分隔線之後開始
   const tpl = lines.findLastIndex(l => /[-─=＝]{4,}/.test(l) && /以上/.test(l));
@@ -417,7 +419,7 @@ function parseArticle(html) {
   lines = lines.filter((l, i) => !/^[^：:]{1,20}[：:]$/.test(l) || (i + 1 < lines.length && !isLabel(lines[i + 1])));
   let excerpt = lines.join(' ').replace(/\s+/g, ' ');
   if (excerpt.length > EXCERPT_LENGTH) excerpt = excerpt.slice(0, EXCERPT_LENGTH) + '…';
-  return { excerpt, image };
+  return { excerpt, image, link };
 }
 
 /** 推文數欄位：'' → 0、'爆' → 100、'X3' → -30、'XX' → -100 */
