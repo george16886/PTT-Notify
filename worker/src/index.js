@@ -16,6 +16,8 @@
 const PTT_BASE = 'https://www.ptt.cc';
 const SEEN_KEEP_PER_RULE = 100;   // 每條規則保留的已通知紀錄數
 const MAX_RULES_PER_USER = 10;    // 一般使用者的規則上限（管理員不限）
+const MAX_NOTIFY_PER_RUN = 10;    // 每次執行最多送出的通知數，其餘下次再送（受每次 50 個對外請求限制）
+const EXCERPT_LENGTH = 150;       // 通知中內文摘錄的字數
 // 可選的檢查間隔（分鐘），都能整除 60，排程每分鐘觸發時以「分鐘數 % 間隔」判斷是否輪到
 const INTERVALS = [1, 2, 5, 10, 15, 30, 60];
 
@@ -230,7 +232,7 @@ async function renderUsers(env) {
  * 定時觸發：只檢查這一分鐘輪到的使用者（分鐘數 % 間隔 = 0）；/check：只檢查指定的 chat。
  */
 async function check(env, { chat = null, now = Date.now() } = {}) {
-  const stats = { rules: 0, sent: 0, sendFailed: 0, initedRules: 0, initedPosts: 0, fetchFailed: [] };
+  const stats = { rules: 0, sent: 0, sendFailed: 0, deferred: 0, initedRules: 0, initedPosts: 0, fetchFailed: [] };
 
   await ensureAdmin(env);
   // 這次要檢查的規則：管理員與已核准使用者，且是指定的 chat 或這一分鐘輪到的使用者
@@ -293,10 +295,22 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
     }
   });
 
-  // 依發文時間排序，舊的先送
+  // 依發文時間排序，舊的先送；超過上限的留到下次（未記錄為已通知，所以不會漏）
   const sorted = [...hits.values()].sort((a, b) => a.post.id.localeCompare(b.post.id));
-  for (const hit of sorted) {
-    if (await sendMessage(env, hit.chatId, formatPost(hit))) {
+  const batch = sorted.slice(0, MAX_NOTIFY_PER_RUN);
+  stats.deferred = sorted.length - batch.length;
+
+  // 抓內文摘錄與縮圖（同一篇文章只抓一次；失敗就只送標題）
+  const articles = new Map();
+  batch.forEach(({ post }) => {
+    if (!articles.has(post.id)) articles.set(post.id, fetchArticle(post.url).catch(() => null));
+  });
+  for (const hit of batch) {
+    const article = await articles.get(hit.post.id);
+    const preview = article?.image
+      ? { link_preview_options: { url: article.image, prefer_large_media: true } }
+      : {};
+    if (await sendMessage(env, hit.chatId, formatPost(hit, article), preview)) {
       hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
       stats.sent++;
     } else {
@@ -331,6 +345,7 @@ function formatSummary(s) {
   if (s.initedRules) lines.push(`新規則 ${s.initedRules} 條已記錄現有 ${s.initedPosts} 篇（不通知）`);
   s.fetchFailed.forEach(f => lines.push('抓取失敗：' + esc(f)));
   if (s.sendFailed) lines.push(`通知傳送失敗 ${s.sendFailed} 則，下次檢查會重試`);
+  if (s.deferred) lines.push(`還有 ${s.deferred} 則新文章，會在下次檢查時送出`);
   return lines.join('\n');
 }
 
@@ -370,6 +385,35 @@ function parseList(html) {
   }).filter(Boolean);
 }
 
+async function fetchArticle(url) {
+  const res = await fetch(url, {
+    headers: { Cookie: 'over18=1', 'User-Agent': 'ptt-notify (+https://github.com/george16886/PTT-Notify)' },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return parseArticle(await res.text());
+}
+
+/** 解析文章頁：內文開頭摘錄（不含標頭、簽名檔、推文）與內文中的第一張圖片 */
+function parseArticle(html) {
+  let body = html.split(/<div id="main-content"[^>]*>/)[1] || '';
+  body = body.split('※ 發信站')[0];                                         // 推文與發信資訊在這之後
+  body = body.replace(/<div class="article-metaline(?:-right)?">[\s\S]*?<\/div>/g, '');
+
+  const img = (body.match(/<div class="richcontent"><img src="([^"]+)"/) || [])[1]
+    || (body.match(/https?:\/\/[^\s"<>]+\.(?:jpe?g|png|gif|webp)\b/i) || [])[0];
+  const image = img && (img.startsWith('//') ? 'https:' + img : img).replace(/^http:/, 'https:');
+
+  const text = decodeEntities(body.replace(/<div class="richcontent">[\s\S]*?<\/div>/g, '').replace(/<[^>]+>/g, ''))
+    .split(/\n--\n/)[0]                                                      // 簽名檔
+    .replace(/https?:\/\/[^\s"<>]+\.(?:jpe?g|png|gif|webp)\b/gi, '');       // 圖片網址改用縮圖顯示
+  const lines = text.split('\n').map(l => l.trim())
+    .filter(l => l && !/^[＝=─\-─━_~～*＊]{4,}$/.test(l));                 // 分隔線
+  let excerpt = lines.join(' ').replace(/\s+/g, ' ');
+  if (excerpt.length > EXCERPT_LENGTH) excerpt = excerpt.slice(0, EXCERPT_LENGTH) + '…';
+  return { excerpt, image };
+}
+
 /** 推文數欄位：'' → 0、'爆' → 100、'X3' → -30、'XX' → -100 */
 function parseScore(nrec) {
   if (!nrec) return 0;
@@ -381,7 +425,7 @@ function parseScore(nrec) {
 
 function decodeEntities(s) {
   return s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(n)).replace(/&amp;/g, '&');
 }
 
 /* ---------- Telegram ---------- */
@@ -389,11 +433,12 @@ function decodeEntities(s) {
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const ruleLabel = r => `[${r.board}] ${r.type}: ${r.value}`;
 
-function formatPost({ post, board, reasons }) {
+function formatPost({ post, board, reasons }, article) {
   return [
     `🔔 <b>[${esc(board)}]</b> ${esc(reasons.join('、'))}`,
     `<a href="${post.url}">${esc(post.title)}</a>`,
     `👍 ${post.nrec || '0'} · ${esc(post.author)} · ${post.date}`,
+    ...(article?.excerpt ? [`<blockquote>${esc(article.excerpt)}</blockquote>`] : []),
   ].join('\n');
 }
 
@@ -416,7 +461,7 @@ async function tg(env, method, payload) {
 
 async function sendMessage(env, chatId, text, extra = {}) {
   const data = await tg(env, 'sendMessage', {
-    chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, ...extra,
+    chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra,
   });
   return data.ok;
 }
