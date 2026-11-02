@@ -407,8 +407,14 @@ function parseArticle(html) {
   const text = decodeEntities(body.replace(/<div class="richcontent">[\s\S]*?<\/div>/g, '').replace(/<[^>]+>/g, ''))
     .split(/\n--\n/)[0]                                                      // 簽名檔
     .replace(/https?:\/\/[^\s"<>]+\.(?:jpe?g|png|gif|webp)\b/gi, '');       // 圖片網址改用縮圖顯示
-  const lines = text.split('\n').map(l => l.trim())
-    .filter(l => l && !/^[＝=─\-─━_~～*＊]{4,}$/.test(l));                 // 分隔線
+  let lines = text.split('\n').map(l => l.trim());
+  // 發文範本的說明（如「----(以上看完後 請按CTRL+y刪除)----」）沒刪掉時，從分隔線之後開始
+  const tpl = lines.findLastIndex(l => /[-─=＝]{4,}/.test(l) && /以上/.test(l));
+  if (tpl >= 0) lines = lines.slice(tpl + 1);
+  lines = lines.filter(l => l && !/^[＝=─\-─━_~～*＊]{4,}$/.test(l));      // 空行、分隔線
+  // 沒填的範本欄位（如「物 品：」後面直接接下一個欄位）；值寫在下一行的欄位保留
+  const isLabel = l => /^[^：:]{1,20}[：:]/.test(l);
+  lines = lines.filter((l, i) => !/^[^：:]{1,20}[：:]$/.test(l) || (i + 1 < lines.length && !isLabel(lines[i + 1])));
   let excerpt = lines.join(' ').replace(/\s+/g, ' ');
   if (excerpt.length > EXCERPT_LENGTH) excerpt = excerpt.slice(0, EXCERPT_LENGTH) + '…';
   return { excerpt, image };
