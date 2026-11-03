@@ -9,8 +9,8 @@
 特色：
 
 - 用 Telegram 按鈕 / 指令管理規則，不需要任何網頁或試算表
-- 通知附上內文開頭摘錄；內文有圖片（或 ImgBB、pCloud 等相簿連結）時以照片訊息送出，
-  Telegram 不支援的格式（如 AVIF）會透過 [wsrv.nl](https://wsrv.nl/) 轉成 JPG；照片送不出時改送純文字
+- 通知附上內文開頭摘錄；內文有圖片（或 ImgBB、pCloud 等相簿連結）時顯示小縮圖，
+  Telegram 不支援的格式（如 AVIF）會透過 [wsrv.nl](https://wsrv.nl/) 轉成 JPG，Imgur 圖片經由 Worker 的 `/img` 中繼
 - 每分鐘檢查一次，跑在 Cloudflare 免費方案上
 - **可以多人共用**：朋友傳訊息給你的 bot 會送出申請，你核准後他就能設定自己的規則
 
@@ -112,7 +112,8 @@ node -e "console.log(require('crypto').randomBytes(24).toString('hex'))"
 npm run deploy
 ```
 
-記下輸出的網址，例如 `https://ptt-notify.<你的子網域>.workers.dev`。
+記下輸出的網址，例如 `https://ptt-notify.<你的子網域>.workers.dev`，填到 `wrangler.jsonc` 的 `vars.PUBLIC_URL`
+（Imgur 縮圖需要），再 `npm run deploy` 一次。
 第一次部署若提示要註冊 workers.dev 子網域，到 Cloudflare 後台 Workers & Pages 設定一個即可。
 
 ### （選用）設定 bot 頭像
@@ -156,8 +157,8 @@ npm run deploy
 ## 設定
 
 - **排程**：`wrangler.jsonc` 的 `triggers.crons` 維持 `* * * * *`（每分鐘觸發），每人實際的檢查頻率在 Telegram 裡設定。
-- **免費方案限制**：每次執行最多 50 個對外請求（搜尋 PTT + 抓文章內文 + 讀相簿頁 + 傳 Telegram，每則通知最多 4 個）。
-  每次最多送 6 則通知（`MAX_NOTIFY_PER_RUN`），其餘下一分鐘再送；相同的搜尋條件會合併成一次請求。
+- **免費方案限制**：每次執行最多 50 個對外請求（搜尋 PTT + 抓文章內文 + 讀相簿頁 + 傳 Telegram，每則通知最多 3 個）。
+  每次最多送 8 則通知（`MAX_NOTIFY_PER_RUN`），其餘下一分鐘再送；相同的搜尋條件會合併成一次請求。
   同一分鐘內輪到的不重複搜尋條件超過約 25 個時，請升級 Workers Paid 方案、減少規則或放寬檢查頻率。
 
 ## 開發

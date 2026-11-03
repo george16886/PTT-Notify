@@ -17,9 +17,11 @@ const PTT_BASE = 'https://www.ptt.cc';
 const USER_AGENT = 'ptt-notify (+https://github.com/george16886/PTT-Notify)';
 const SEEN_KEEP_PER_RULE = 100;   // 每條規則保留的已通知紀錄數
 const MAX_RULES_PER_USER = 10;    // 一般使用者的規則上限（管理員不限）
-// 每次執行最多送出的通知數，其餘下次再送。每則最多 4 個對外請求（文章、相簿頁、照片、失敗時改送文字），
+// 每次執行最多送出的通知數，其餘下次再送。每則最多 3 個對外請求（文章、相簿頁、Telegram），
 // 加上搜尋 PTT 的請求，需低於每次執行 50 個的上限
-const MAX_NOTIFY_PER_RUN = 6;
+const MAX_NOTIFY_PER_RUN = 8;
+// 預覽網址會被轉到網頁版的圖床（如 Imgur），改經由本 Worker 的 /img 中繼，Telegram 才拿得到圖片本身
+const IMAGE_PROXY_HOSTS = /(?:^|\.)imgur\.com$/i;
 const EXCERPT_LENGTH = 150;       // 通知中內文摘錄的字數
 // 可選的檢查間隔（分鐘），都能整除 60，排程每分鐘觸發時以「分鐘數 % 間隔」判斷是否輪到
 const INTERVALS = [1, 2, 5, 10, 15, 30, 60];
@@ -104,9 +106,33 @@ export default {
       return new Response('ok'); // 一律回 200，避免 Telegram 重送
     }
     if (url.pathname === '/setup') return setup(env, url);
+    if (url.pathname === '/img') return imageProxy(env, url);
     return new Response('PTT Notify');
   },
 };
+
+/** 圖片中繼：GET /img?u=<圖片網址>&s=<簽章>，只接受本程式簽過的網址，只回傳圖片 */
+async function imageProxy(env, url) {
+  const target = url.searchParams.get('u') || '';
+  if (!/^https:\/\//.test(target) || url.searchParams.get('s') !== await sign(env, target)) {
+    return new Response('forbidden', { status: 403 });
+  }
+  const res = await fetch(target, {
+    headers: { Accept: 'image/*', 'User-Agent': USER_AGENT },
+    cf: { cacheEverything: true, cacheTtl: 86400 },
+  });
+  const type = res.headers.get('content-type') || '';
+  if (!res.ok || !type.startsWith('image/')) return new Response('not an image', { status: 502 });
+  return new Response(res.body, { headers: { 'Content-Type': type, 'Cache-Control': 'public, max-age=86400' } });
+}
+
+/** 以 TG_WEBHOOK_SECRET 對網址做 HMAC 簽章，防止 /img 被當成公開代理 */
+async function sign(env, text) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(env.TG_WEBHOOK_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(text)));
+  return [...mac.slice(0, 12)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
 
 /** 設定 webhook 與指令選單：GET /setup?key=<TG_WEBHOOK_SECRET> */
 async function setup(env, url) {
@@ -310,7 +336,7 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
     articles.set(post.id, fetchArticle(post.url).then(async article => {
       // 沒有圖片檔、只有相簿 / 分享頁連結時，讀出頁面的 og:image；讀不到就不顯示預覽
       if (!article.image && article.link) article.image = await fetchPageImage(article.link).catch(() => null);
-      if (article.image) article.image = previewableImage(article.image);
+      if (article.image) article.image = await previewableImage(env, article.image);
       return article;
     }).catch(() => null));
   });
@@ -410,9 +436,15 @@ async function fetchPageImage(url) {
 }
 
 /** Telegram 連結預覽不支援的圖片格式（如 ImgBB 的 AVIF），透過 wsrv.nl 轉成 JPG */
-function previewableImage(url) {
-  if (!/\.(?:avif|heic|heif|bmp|tiff?)(?:$|[?#])/i.test(url)) return url;
-  return `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=jpg&w=1280&we`;
+/** Imgur 這類會把預覽轉到網頁版的圖床，改經由本 Worker 的 /img 中繼（需設定 PUBLIC_URL） */
+async function previewableImage(env, url) {
+  if (/\.(?:avif|heic|heif|bmp|tiff?)(?:$|[?#])/i.test(url)) {
+    return `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=jpg&w=1280&we`;
+  }
+  if (env.PUBLIC_URL && IMAGE_PROXY_HOSTS.test(new URL(url).hostname)) {
+    return `${env.PUBLIC_URL.replace(/\/$/, '')}/img?u=${encodeURIComponent(url)}&s=${await sign(env, url)}`;
+  }
+  return url;
 }
 
 /** 解析文章頁：內文開頭摘錄（不含標頭、簽名檔、推文）與內文中的第一張圖片 */
@@ -496,16 +528,10 @@ async function sendMessage(env, chatId, text, extra = {}) {
   return data.ok;
 }
 
-/**
- * 送出文章通知：有圖片時送照片訊息（內文當說明），Telegram 下載照片失敗就改送純文字。
- * 不用連結預覽：像 Imgur 會對預覽抓取回傳網頁版，預覽會多出網站的說明文字。
- */
-async function sendPost(env, chatId, text, image) {
-  if (image && text.length <= 1000) {   // 照片說明上限 1024 字
-    const res = await tg(env, 'sendPhoto', { chat_id: chatId, photo: image, caption: text, parse_mode: 'HTML' });
-    if (res.ok) return true;
-  }
-  return sendMessage(env, chatId, text);
+/** 送出文章通知；有圖片時以小縮圖的連結預覽顯示 */
+function sendPost(env, chatId, text, image) {
+  const preview = image ? { link_preview_options: { url: image, prefer_small_media: true } } : {};
+  return sendMessage(env, chatId, text, preview);
 }
 
 /** 某個 chat 的規則列表與暫停 / 刪除按鈕；顯示連續序號，按鈕內部用資料庫 id */

@@ -5,6 +5,10 @@
   "compatibility_date": "2026-09-01",
   // 檢查頻率（UTC cron），最短每分鐘
   "triggers": { "crons": ["* * * * *"] },
+  "vars": {
+    // 本 Worker 的網址（npm run deploy 輸出的那個），Imgur 等圖片縮圖經由 <PUBLIC_URL>/img 中繼
+    "PUBLIC_URL": "https://ptt-notify.george16886.workers.dev"
+  },
   "d1_databases": [
     {
       "binding": "DB",
