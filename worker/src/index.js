@@ -527,9 +527,9 @@ async function sendMessage(env, chatId, text, extra = {}) {
   return data.ok;
 }
 
-/** 送出文章通知；有圖片時以小縮圖的連結預覽顯示 */
+/** 送出文章通知；有圖片時以連結預覽顯示（大圖，手機上較清楚） */
 function sendPost(env, chatId, text, image) {
-  const preview = image ? { link_preview_options: { url: image, prefer_small_media: true } } : {};
+  const preview = image ? { link_preview_options: { url: image, prefer_large_media: true } } : {};
   return sendMessage(env, chatId, text, preview);
 }
 
