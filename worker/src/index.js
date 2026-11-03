@@ -17,9 +17,9 @@ const PTT_BASE = 'https://www.ptt.cc';
 const USER_AGENT = 'ptt-notify (+https://github.com/george16886/PTT-Notify)';
 const SEEN_KEEP_PER_RULE = 100;   // 每條規則保留的已通知紀錄數
 const MAX_RULES_PER_USER = 10;    // 一般使用者的規則上限（管理員不限）
-// 每次執行最多送出的通知數，其餘下次再送。每則最多 3 個對外請求（文章、相簿頁、Telegram），
+// 每次執行最多送出的通知數，其餘下次再送。每則最多 4 個對外請求（文章、相簿頁、照片、失敗時改送文字），
 // 加上搜尋 PTT 的請求，需低於每次執行 50 個的上限
-const MAX_NOTIFY_PER_RUN = 8;
+const MAX_NOTIFY_PER_RUN = 6;
 const EXCERPT_LENGTH = 150;       // 通知中內文摘錄的字數
 // 可選的檢查間隔（分鐘），都能整除 60，排程每分鐘觸發時以「分鐘數 % 間隔」判斷是否輪到
 const INTERVALS = [1, 2, 5, 10, 15, 30, 60];
@@ -316,8 +316,7 @@ async function check(env, { chat = null, now = Date.now() } = {}) {
   });
   for (const hit of batch) {
     const article = await articles.get(hit.post.id);
-    const preview = article?.image ? { link_preview_options: { url: article.image, prefer_large_media: true } } : {};
-    if (await sendMessage(env, hit.chatId, formatPost(hit, article), preview)) {
+    if (await sendPost(env, hit.chatId, formatPost(hit, article), article?.image)) {
       hit.ruleIds.forEach(id => newSeen.push([id, hit.post.id]));
       stats.sent++;
     } else {
@@ -495,6 +494,18 @@ async function sendMessage(env, chatId, text, extra = {}) {
     chat_id: chatId, text, parse_mode: 'HTML', link_preview_options: { is_disabled: true }, ...extra,
   });
   return data.ok;
+}
+
+/**
+ * 送出文章通知：有圖片時送照片訊息（內文當說明），Telegram 下載照片失敗就改送純文字。
+ * 不用連結預覽：像 Imgur 會對預覽抓取回傳網頁版，預覽會多出網站的說明文字。
+ */
+async function sendPost(env, chatId, text, image) {
+  if (image && text.length <= 1000) {   // 照片說明上限 1024 字
+    const res = await tg(env, 'sendPhoto', { chat_id: chatId, photo: image, caption: text, parse_mode: 'HTML' });
+    if (res.ok) return true;
+  }
+  return sendMessage(env, chatId, text);
 }
 
 /** 某個 chat 的規則列表與暫停 / 刪除按鈕；顯示連續序號，按鈕內部用資料庫 id */
