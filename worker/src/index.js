@@ -106,22 +106,20 @@ export default {
       return new Response('ok'); // 一律回 200，避免 Telegram 重送
     }
     if (url.pathname === '/setup') return setup(env, url);
-    if (url.pathname === '/img') return imageProxy(env, url);
+    if (url.pathname === '/img') return imageProxy(env, url, request);
     return new Response('PTT Notify');
   },
 };
 
 /** 圖片中繼：GET /img?u=<圖片網址>&s=<簽章>，只接受本程式簽過的網址，只回傳圖片 */
-async function imageProxy(env, url) {
+async function imageProxy(env, url, request) {
   const target = url.searchParams.get('u') || '';
   if (!/^https:\/\//.test(target) || url.searchParams.get('s') !== await sign(env, target)) {
     return new Response('forbidden', { status: 403 });
   }
-  const res = await fetch(target, {
-    headers: { Accept: 'image/*', 'User-Agent': USER_AGENT },
-    cf: { cacheEverything: true, cacheTtl: 86400 },
-  });
+  const res = await fetch(target, { headers: { Accept: 'image/*', 'User-Agent': USER_AGENT } });
   const type = res.headers.get('content-type') || '';
+  console.log(`img proxy colo=${request.cf?.colo} country=${request.cf?.country} status=${res.status} type=${type} len=${res.headers.get('content-length')} final=${res.url} target=${target}`);
   if (!res.ok || !type.startsWith('image/')) return new Response('not an image', { status: 502 });
   return new Response(res.body, { headers: { 'Content-Type': type, 'Cache-Control': 'public, max-age=86400' } });
 }
@@ -442,7 +440,8 @@ async function previewableImage(env, url) {
     return `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=jpg&w=1280&we`;
   }
   if (env.PUBLIC_URL && IMAGE_PROXY_HOSTS.test(new URL(url).hostname)) {
-    return `${env.PUBLIC_URL.replace(/\/$/, '')}/img?u=${encodeURIComponent(url)}&s=${await sign(env, url)}`;
+    // v 不參與簽章，只讓每則通知的網址不同，避免 Telegram 沿用之前快取的預覽（例如 Imgur 的地區限制圖）
+    return `${env.PUBLIC_URL.replace(/\/$/, '')}/img?u=${encodeURIComponent(url)}&s=${await sign(env, url)}&v=${Date.now()}`;
   }
   return url;
 }
