@@ -430,7 +430,11 @@ async function fetchPageImage(url) {
   if (!res.ok) return null;
   const tag = (await res.text()).match(/<meta[^>]+(?:property|name)=["'](?:og:image|twitter:image)["'][^>]*>/i);
   const content = tag && (tag[0].match(/content=["']([^"']+)["']/i) || [])[1];
-  return content ? new URL(decodeEntities(content), url).href : null;
+  if (!content) return null;
+  const image = new URL(decodeEntities(content), url);
+  // 全站共用的預設分享圖（如動詞圖雲的 og-image.jpg）不是照片本身，寧可不顯示
+  if (/^(?:og[-_]?image|og|default|logo|icon|share|banner|placeholder)(?:[-_][\w-]*)?\.\w+$/i.test(image.pathname.split('/').pop())) return null;
+  return image.href;
 }
 
 /** Telegram 連結預覽不支援的圖片格式（如 ImgBB 的 AVIF），透過 wsrv.nl 轉成 JPG */
